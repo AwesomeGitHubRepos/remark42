@@ -6,7 +6,7 @@ import (
 	"path"
 	"time"
 
-	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
 	"github.com/go-pkgz/auth"
 	cache "github.com/go-pkgz/lcw"
@@ -111,9 +111,9 @@ func (a *admin) deleteMeRequestCtrl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err = a.dataService.DeleteUserDetail(claims.Audience, claims.User.ID, engine.UserEmail); err != nil {
+	if err = a.dataService.DeleteUserDetail(claims.Audience, claims.User.ID, engine.AllUserDetails); err != nil {
 		code := parseError(err, rest.ErrInternal)
-		rest.SendErrorJSON(w, r, http.StatusBadRequest, err, "can't delete email for user", code)
+		rest.SendErrorJSON(w, r, http.StatusBadRequest, err, "can't delete user details for user", code)
 		return
 	}
 
