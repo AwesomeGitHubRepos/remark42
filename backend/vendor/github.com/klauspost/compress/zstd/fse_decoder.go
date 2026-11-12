@@ -5,8 +5,10 @@
 package zstd
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 )
 
 const (
@@ -19,7 +21,7 @@ const (
 	 *  Increasing memory usage improves compression ratio
 	 *  Reduced memory usage can improve speed, due to cache effect
 	 *  Recommended max value is 14, for 16KB, which nicely fits into Intel x86 L1 cache */
-	maxMemoryUsage = 11
+	maxMemoryUsage = tablelogAbsoluteMax + 2
 
 	maxTableLog    = maxMemoryUsage - 2
 	maxTablesize   = 1 << maxTableLog
@@ -41,13 +43,36 @@ type fseDecoder struct {
 	preDefined bool
 }
 
+// codeShare returns, in 1/256ths, the table's probability mass on symbols
+// minCode and above: for a table read from the block, the share of its
+// sequences with those codes. The predefined tables describe the format's
+// defaults, not the block, and RLE tables have no distribution; both
+// report -1.
+func (s *fseDecoder) codeShare(minCode int) int {
+	if s == nil || s.preDefined || s.actualTableLog == 0 {
+		return -1
+	}
+	n := 0
+	for c := minCode; c < int(s.symbolLen); c++ {
+		switch v := int(s.norm[c]); {
+		case v > 0:
+			n += v
+		case v < 0:
+			n++ // -1 marks a probability below one slot; it occupies one
+		}
+	}
+	return n * 256 >> s.actualTableLog
+}
+
 // tableStep returns the next table index.
 func tableStep(tableSize uint32) uint32 {
 	return (tableSize >> 1) + (tableSize >> 3) + 3
 }
 
-// readNCount will read the symbol distribution so decoding tables can be constructed.
-func (s *fseDecoder) readNCount(b *byteReader, maxSymbol uint16) error {
+// readNCount will read the symbol distribution for table t and build its
+// decoding table.
+func (s *fseDecoder) readNCount(b *byteReader, t tableIndex) error {
+	maxSymbol := uint16(maxTableSymbol[t])
 	var (
 		charnum   uint16
 		previous0 bool
@@ -55,7 +80,7 @@ func (s *fseDecoder) readNCount(b *byteReader, maxSymbol uint16) error {
 	if b.remain() < 4 {
 		return errors.New("input too small")
 	}
-	bitStream := b.Uint32()
+	bitStream := b.Uint32NC()
 	nbBits := uint((bitStream & 0xF) + minTablelog) // extract tableLog
 	if nbBits > tablelogAbsoluteMax {
 		println("Invalid tablelog:", nbBits)
@@ -79,7 +104,8 @@ func (s *fseDecoder) readNCount(b *byteReader, maxSymbol uint16) error {
 				n0 += 24
 				if r := b.remain(); r > 5 {
 					b.advance(2)
-					bitStream = b.Uint32() >> bitCount
+					// The check above should make sure we can read 32 bits
+					bitStream = b.Uint32NC() >> bitCount
 				} else {
 					// end of bit stream
 					bitStream >>= 16
@@ -104,10 +130,11 @@ func (s *fseDecoder) readNCount(b *byteReader, maxSymbol uint16) error {
 				charnum++
 			}
 
-			if r := b.remain(); r >= 7 || r+int(bitCount>>3) >= 4 {
+			if r := b.remain(); r >= 7 || r-int(bitCount>>3) >= 4 {
 				b.advance(bitCount >> 3)
 				bitCount &= 7
-				bitStream = b.Uint32() >> bitCount
+				// The check above should make sure we can read 32 bits
+				bitStream = b.Uint32NC() >> bitCount
 			} else {
 				bitStream >>= 2
 			}
@@ -118,7 +145,7 @@ func (s *fseDecoder) readNCount(b *byteReader, maxSymbol uint16) error {
 
 		if int32(bitStream)&(threshold-1) < max {
 			count = int32(bitStream) & (threshold - 1)
-			if debug && nbBits < 1 {
+			if debugAsserts && nbBits < 1 {
 				panic("nbBits underflow")
 			}
 			bitCount += nbBits - 1
@@ -148,23 +175,23 @@ func (s *fseDecoder) readNCount(b *byteReader, maxSymbol uint16) error {
 			threshold >>= 1
 		}
 
-		//println("b.off:", b.off, "len:", len(b.b), "bc:", bitCount, "remain:", b.remain())
-		if r := b.remain(); r >= 7 || r+int(bitCount>>3) >= 4 {
+		if r := b.remain(); r >= 7 || r-int(bitCount>>3) >= 4 {
 			b.advance(bitCount >> 3)
 			bitCount &= 7
+			// The check above should make sure we can read 32 bits
+			bitStream = b.Uint32NC() >> (bitCount & 31)
 		} else {
 			bitCount -= (uint)(8 * (len(b.b) - 4 - b.off))
 			b.off = len(b.b) - 4
-			//println("b.off:", b.off, "len:", len(b.b), "bc:", bitCount, "iend", iend)
+			bitStream = b.Uint32() >> (bitCount & 31)
 		}
-		bitStream = b.Uint32() >> (bitCount & 31)
-		//printf("bitstream is now: 0b%b", bitStream)
 	}
 	s.symbolLen = charnum
 	if s.symbolLen <= 1 {
 		return fmt.Errorf("symbolLen (%d) too small", s.symbolLen)
 	}
-	if s.symbolLen > maxSymbolValue+1 {
+	// A run of zero counts can step past maxSymbol, so check the total.
+	if s.symbolLen > maxSymbol+1 {
 		return fmt.Errorf("symbolLen (%d) too big", s.symbolLen)
 	}
 	if remaining != 1 {
@@ -177,8 +204,53 @@ func (s *fseDecoder) readNCount(b *byteReader, maxSymbol uint16) error {
 		return fmt.Errorf("corruption detected (total %d != %d)", gotTotal, 1<<s.actualTableLog)
 	}
 	b.advance((bitCount + 7) >> 3)
-	// println(s.norm[:s.symbolLen], s.symbolLen)
-	return s.buildDtable()
+	return s.buildDtable(&symbolExtX[t])
+}
+
+// symbolExt holds, per symbol, a decSymbol with only addBits and baseline set.
+type symbolExt [maxMatchLengthSymbol + 1]decSymbol
+
+// buildDtable builds the decoding table, taking each state's addBits and
+// baseline from its symbol's entry in ext.
+func (s *fseDecoder) buildDtable(ext *symbolExt) error {
+	if int(s.symbolLen) > len(ext) {
+		return fmt.Errorf("symbolLen (%d) too big", s.symbolLen)
+	}
+	if err := s.fillDtable(ext); err != nil {
+		return err
+	}
+	// addBits never decreases with the symbol (checked in initPredefined),
+	// so the last symbol has the most. It may exceed the table's actual
+	// maximum only if the last symbol has no states, which just costs an
+	// extra bitreader fill.
+	s.maxBits = 0
+	if s.symbolLen > 0 {
+		s.maxBits = ext[s.symbolLen-1].addBits()
+	}
+	return nil
+}
+
+func (s *fseDecoder) mustReadFrom(r io.Reader) {
+	fatalErr := func(err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+	// 	dt             [maxTablesize]decSymbol // Decompression table.
+	//	symbolLen      uint16                  // Length of active part of the symbol table.
+	//	actualTableLog uint8                   // Selected tablelog.
+	//	maxBits        uint8                   // Maximum number of additional bits
+	//	// used for table creation to avoid allocations.
+	//	stateTable [256]uint16
+	//	norm       [maxSymbolValue + 1]int16
+	//	preDefined bool
+	fatalErr(binary.Read(r, binary.LittleEndian, &s.dt))
+	fatalErr(binary.Read(r, binary.LittleEndian, &s.symbolLen))
+	fatalErr(binary.Read(r, binary.LittleEndian, &s.actualTableLog))
+	fatalErr(binary.Read(r, binary.LittleEndian, &s.maxBits))
+	fatalErr(binary.Read(r, binary.LittleEndian, &s.stateTable))
+	fatalErr(binary.Read(r, binary.LittleEndian, &s.norm))
+	fatalErr(binary.Read(r, binary.LittleEndian, &s.preDefined))
 }
 
 // decSymbol contains information about a state entry,
@@ -203,16 +275,8 @@ func (d decSymbol) newState() uint16 {
 	return uint16(d >> 16)
 }
 
-func (d decSymbol) baseline() uint32 {
-	return uint32(d >> 32)
-}
-
 func (d decSymbol) baselineInt() int {
 	return int(d >> 32)
-}
-
-func (d *decSymbol) set(nbits, addBits uint8, newState uint16, baseline uint32) {
-	*d = decSymbol(nbits) | (decSymbol(addBits) << 8) | (decSymbol(newState) << 16) | (decSymbol(baseline) << 32)
 }
 
 func (d *decSymbol) setNBits(nBits uint8) {
@@ -228,11 +292,6 @@ func (d *decSymbol) setAddBits(addBits uint8) {
 func (d *decSymbol) setNewState(state uint16) {
 	const mask = 0xffffffff0000ffff
 	*d = (*d & mask) | decSymbol(state)<<16
-}
-
-func (d *decSymbol) setBaseline(baseline uint32) {
-	const mask = 0xffffffff
-	*d = (*d & mask) | decSymbol(baseline)<<32
 }
 
 func (d *decSymbol) setExt(addBits uint8, baseline uint32) {
@@ -256,89 +315,6 @@ func (s *fseDecoder) setRLE(symbol decSymbol) {
 	s.dt[0] = symbol
 }
 
-// buildDtable will build the decoding table.
-func (s *fseDecoder) buildDtable() error {
-	tableSize := uint32(1 << s.actualTableLog)
-	highThreshold := tableSize - 1
-	symbolNext := s.stateTable[:256]
-
-	// Init, lay down lowprob symbols
-	{
-		for i, v := range s.norm[:s.symbolLen] {
-			if v == -1 {
-				s.dt[highThreshold].setAddBits(uint8(i))
-				highThreshold--
-				symbolNext[i] = 1
-			} else {
-				symbolNext[i] = uint16(v)
-			}
-		}
-	}
-	// Spread symbols
-	{
-		tableMask := tableSize - 1
-		step := tableStep(tableSize)
-		position := uint32(0)
-		for ss, v := range s.norm[:s.symbolLen] {
-			for i := 0; i < int(v); i++ {
-				s.dt[position].setAddBits(uint8(ss))
-				position = (position + step) & tableMask
-				for position > highThreshold {
-					// lowprob area
-					position = (position + step) & tableMask
-				}
-			}
-		}
-		if position != 0 {
-			// position must reach all cells once, otherwise normalizedCounter is incorrect
-			return errors.New("corrupted input (position != 0)")
-		}
-	}
-
-	// Build Decoding table
-	{
-		tableSize := uint16(1 << s.actualTableLog)
-		for u, v := range s.dt[:tableSize] {
-			symbol := v.addBits()
-			nextState := symbolNext[symbol]
-			symbolNext[symbol] = nextState + 1
-			nBits := s.actualTableLog - byte(highBits(uint32(nextState)))
-			s.dt[u&maxTableMask].setNBits(nBits)
-			newState := (nextState << nBits) - tableSize
-			if newState > tableSize {
-				return fmt.Errorf("newState (%d) outside table size (%d)", newState, tableSize)
-			}
-			if newState == uint16(u) && nBits == 0 {
-				// Seems weird that this is possible with nbits > 0.
-				return fmt.Errorf("newState (%d) == oldState (%d) and no bits", newState, u)
-			}
-			s.dt[u&maxTableMask].setNewState(newState)
-		}
-	}
-	return nil
-}
-
-// transform will transform the decoder table into a table usable for
-// decoding without having to apply the transformation while decoding.
-// The state will contain the base value and the number of bits to read.
-func (s *fseDecoder) transform(t []baseOffset) error {
-	tableSize := uint16(1 << s.actualTableLog)
-	s.maxBits = 0
-	for i, v := range s.dt[:tableSize] {
-		add := v.addBits()
-		if int(add) >= len(t) {
-			return fmt.Errorf("invalid decoding table entry %d, symbol %d >= max (%d)", i, v.addBits(), len(t))
-		}
-		lu := t[add]
-		if lu.addBits > s.maxBits {
-			s.maxBits = lu.addBits
-		}
-		v.setExt(lu.addBits, lu.baseLine)
-		s.dt[i] = v
-	}
-	return nil
-}
-
 type fseState struct {
 	dt    []decSymbol
 	state decSymbol
@@ -351,34 +327,7 @@ func (s *fseState) init(br *bitReader, tableLog uint8, dt []decSymbol) {
 	s.state = dt[br.getBits(tableLog)]
 }
 
-// next returns the current symbol and sets the next state.
-// At least tablelog bits must be available in the bit reader.
-func (s *fseState) next(br *bitReader) {
-	lowBits := uint16(br.getBits(s.state.nbBits()))
-	s.state = s.dt[s.state.newState()+lowBits]
-}
-
-// finished returns true if all bits have been read from the bitstream
-// and the next state would require reading bits from the input.
-func (s *fseState) finished(br *bitReader) bool {
-	return br.finished() && s.state.nbBits() > 0
-}
-
-// final returns the current state symbol without decoding the next.
-func (s *fseState) final() (int, uint8) {
-	return s.state.baselineInt(), s.state.addBits()
-}
-
 // final returns the current state symbol without decoding the next.
 func (s decSymbol) final() (int, uint8) {
 	return s.baselineInt(), s.addBits()
-}
-
-// nextFast returns the next symbol and sets the next state.
-// This can only be used if no symbols are 0 bits.
-// At least tablelog bits must be available in the bit reader.
-func (s *fseState) nextFast(br *bitReader) (uint32, uint8) {
-	lowBits := uint16(br.getBitsFast(s.state.nbBits()))
-	s.state = s.dt[s.state.newState()+lowBits]
-	return s.state.baseline(), s.state.addBits()
 }

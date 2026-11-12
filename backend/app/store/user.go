@@ -24,6 +24,7 @@ type User struct {
 	Verified          bool   `json:"verified,omitempty"`
 	EmailSubscription bool   `json:"email_subscription,omitempty"`
 	SiteID            string `json:"site_id,omitempty"`
+	PaidSub           bool   `json:"paid_sub,omitempty"`
 }
 
 var reValidSha = regexp.MustCompile("^[a-fA-F0-9]{40}$")
@@ -48,7 +49,6 @@ func EncodeID(id string) string {
 
 // hashWithFallback tries to has val with hash.Hash and fallback to crc if needed
 func hashWithFallback(h hash.Hash, val string) string {
-
 	if reValidSha.MatchString(val) {
 		return val // already hashed
 	}

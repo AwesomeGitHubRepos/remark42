@@ -1,0 +1,91 @@
+import type { FunctionComponent } from 'preact';
+import { h, type AriaRole } from 'preact';
+import { shallowEqual } from 'store/context';
+import { useCallback } from 'preact/hooks';
+import clsx from 'clsx';
+
+import { useIntl } from 'common/intl';
+import type { Comment as CommentInterface } from 'common/types';
+import { getHandleClickProps } from 'common/accessibility';
+import type { StoreState } from 'store';
+import { useAppDispatch, useAppSelector } from 'store';
+import { setCollapse } from 'store/thread/actions';
+import { getThreadIsCollapsed } from 'store/thread/getters';
+import { InView } from 'components/root/in-view/in-view';
+import { ConnectedComment as Comment } from 'components/comment/connected-comment';
+import { CommentForm } from 'components/comment-form';
+
+import styles from './thread.module.css';
+
+interface Props {
+  id: CommentInterface['id'];
+  childs?: CommentInterface['id'][];
+  level: number;
+
+  getPreview(text: string): Promise<string>;
+}
+
+const commentSelector = (id: string) => (state: StoreState) => {
+  const { theme, comments } = state;
+  const { allComments, childComments } = comments;
+  const comment = allComments[id];
+  const childs = childComments[id];
+  const collapsed = getThreadIsCollapsed(comment)(state);
+
+  return { comment, childs, collapsed, theme };
+};
+
+export const Thread: FunctionComponent<Props> = ({ id, level, getPreview }) => {
+  const dispatch = useAppDispatch();
+  const intl = useIntl();
+  const { collapsed, comment, childs, theme } = useAppSelector(commentSelector(id), shallowEqual);
+  const collapse = useCallback(() => {
+    dispatch(setCollapse(id, !collapsed));
+  }, [id, collapsed, dispatch]);
+
+  if (comment.hidden) return null;
+
+  const indented = level > 0;
+  const repliesCount = childs ? childs.length : 0;
+
+  return (
+    <div
+      className={clsx(
+        styles.root,
+        indented && styles.indented,
+        level === 6 && styles.level6,
+        theme === 'dark' && styles.themeDark
+      )}
+      role={(!collapsed && !!repliesCount ? 'listitem list' : 'listitem') as AriaRole}
+      aria-expanded={!collapsed}
+    >
+      <InView>
+        {(inviewProps) => (
+          <Comment
+            CommentForm={CommentForm}
+            ref={inviewProps.ref}
+            key={`comment-${id}`}
+            view="main"
+            intl={intl}
+            data={comment}
+            repliesCount={repliesCount}
+            level={level}
+            inView={inviewProps.inView}
+          />
+        )}
+      </InView>
+
+      {!collapsed &&
+        childs &&
+        !!childs.length &&
+        childs.map((currentId) => (
+          <Thread key={`thread-${currentId}`} id={currentId} level={Math.min(level + 1, 6)} getPreview={getPreview} />
+        ))}
+      {level < 6 && (
+        <div className={collapsed ? styles.collapsed : styles.collapse} {...getHandleClickProps(collapse)}>
+          <div />
+        </div>
+      )}
+    </div>
+  );
+};

@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"strings"
 	"time"
 
@@ -22,6 +22,12 @@ func (r *RPC) Save(id string, img []byte) error {
 	return err
 }
 
+// ResetCleanupTimer resets cleanup timer for the image
+func (r *RPC) ResetCleanupTimer(id string) error {
+	_, err := r.Call("image.reset_cleanup_timer", id)
+	return err
+}
+
 // Load image with given id
 func (r *RPC) Load(id string) ([]byte, error) {
 	resp, err := r.Call("image.load", id)
@@ -32,7 +38,13 @@ func (r *RPC) Load(id string) ([]byte, error) {
 	if err := json.Unmarshal(*resp.Result, &rawImg); err != nil {
 		return nil, err
 	}
-	return ioutil.ReadAll(base64.NewDecoder(base64.StdEncoding, strings.NewReader(rawImg)))
+	return io.ReadAll(base64.NewDecoder(base64.StdEncoding, strings.NewReader(rawImg)))
+}
+
+// Delete image from storage
+func (r *RPC) Delete(id string) error {
+	_, err := r.Call("image.delete", id)
+	return err
 }
 
 // Commit file stored in staging location by moving it to permanent location

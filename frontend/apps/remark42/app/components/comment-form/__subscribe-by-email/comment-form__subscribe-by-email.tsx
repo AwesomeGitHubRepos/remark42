@@ -1,0 +1,306 @@
+import type { FunctionComponent } from 'preact';
+import { h, Fragment } from 'preact';
+import { useState, useCallback, useRef } from 'preact/hooks';
+import { useSelector, useDispatch } from 'store/context';
+import clsx from 'clsx';
+
+import type { IntlShape } from 'common/intl';
+import { useIntl, defineMessages, FormattedMessage } from 'common/intl';
+import type { User } from 'common/types';
+import type { StoreState } from 'store';
+import { setUserSubscribed } from 'store/user/actions';
+import type { RequestError } from 'utils/errorUtils';
+import { extractErrorMessageFromResponse } from 'utils/errorUtils';
+import { useTheme } from 'hooks/useTheme';
+import { getHandleClickProps } from 'common/accessibility';
+import { emailVerificationForSubscribe, emailConfirmationForSubscribe, unsubscribeFromEmailUpdates } from 'common/api';
+import { Input } from 'components/input';
+import { Button } from 'components/button';
+import { Dropdown, useDropdown } from 'components/dropdown';
+import { Preloader } from 'components/preloader';
+import { TextareaAutosize } from 'components/textarea-autosize';
+import { getPersistedEmail } from 'components/auth/auth.utils';
+import { isUserAnonymous } from 'utils/isUserAnonymous';
+import { isJwtExpired } from 'utils/jwt';
+
+import styles from './subscribe-by-email.module.css';
+
+const emailRegexp = /[^@]+@[^.]+\..+/;
+
+enum Step {
+  Email,
+  Token,
+  Subscribed,
+  Unsubscribed,
+}
+
+const messages = defineMessages({
+  token: {
+    id: 'token',
+    defaultMessage: 'Paste the token from the email',
+  },
+  expiredToken: {
+    id: 'token.expired',
+    defaultMessage: 'Token is expired',
+  },
+  haveSubscribed: {
+    id: 'subscribeByEmail.have-been-subscribed',
+    defaultMessage: 'You have subscribed to email updates',
+  },
+  subscribed: {
+    id: 'subscribeByEmail.subscribed',
+    defaultMessage: 'You are subscribed to email updates',
+  },
+  submit: {
+    id: 'subscribeByEmail.submit',
+    defaultMessage: 'Submit',
+  },
+  subscribe: {
+    id: 'subscribeByEmail.subscribe',
+    defaultMessage: 'Subscribe',
+  },
+  subscribeByEmail: {
+    id: 'subscribeByEmail.subscribe-by-email',
+    defaultMessage: 'Subscribe by email',
+  },
+  onlyRegisteredUsers: {
+    id: 'subscribeByEmail.only-registered-users',
+    defaultMessage: 'Only available to registered users',
+  },
+  email: {
+    id: 'subscribeByEmail.email',
+    defaultMessage: 'Email',
+  },
+});
+
+const renderEmailPart = (
+  loading: boolean,
+  intl: IntlShape,
+  emailAddress: string,
+  handleChangeEmail: (e: Event) => void
+) => (
+  <>
+    <div className={styles.title}>
+      <FormattedMessage id="subscribeByEmail.subscribe-to-replies" defaultMessage="Email subscription to replies" />
+    </div>
+    <Input
+      autofocus
+      placeholder={intl.formatMessage(messages.email)}
+      value={emailAddress}
+      onInput={handleChangeEmail}
+      disabled={loading}
+    />
+  </>
+);
+
+const renderTokenPart = (
+  loading: boolean,
+  intl: IntlShape,
+  token: string,
+  handleChangeToken: (e: Event) => void,
+  setEmailStep: () => void
+) => (
+  <>
+    <Button kind="link" {...getHandleClickProps(setEmailStep)}>
+      <FormattedMessage id="subscribeByEmail.back" defaultMessage="Back" />
+    </Button>
+    <TextareaAutosize
+      className={styles.tokenInput}
+      placeholder={intl.formatMessage(messages.token)}
+      autofocus
+      onInput={handleChangeToken}
+      disabled={loading}
+      value={token}
+    />
+  </>
+);
+
+export const SubscribeByEmailForm: FunctionComponent = () => {
+  const theme = useTheme();
+  const dispatch = useDispatch();
+  const intl = useIntl();
+  const { close } = useDropdown();
+  const subscribed = useSelector<StoreState, boolean>(({ user }) =>
+    user === null ? false : Boolean(user.email_subscription)
+  );
+  const justSubscribed = useRef<Boolean>(false);
+
+  const [step, setStep] = useState(subscribed ? Step.Subscribed : Step.Email);
+
+  const [token, setToken] = useState('');
+  const [emailAddress, setEmailAddress] = useState(getPersistedEmail);
+
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const sendForm = useCallback(
+    async (currentToken: string = token) => {
+      setLoading(true);
+      setError(null);
+
+      try {
+        let emailVerificationResponse;
+
+        switch (step) {
+          case Step.Email:
+            try {
+              emailVerificationResponse = await emailVerificationForSubscribe(emailAddress);
+              justSubscribed.current = true;
+            } catch (e) {
+              if ((e as RequestError).code !== 409) {
+                throw e;
+              }
+              emailVerificationResponse = { address: emailAddress, updated: true };
+            }
+            if (emailVerificationResponse.updated) {
+              dispatch(setUserSubscribed(true));
+              setStep(Step.Subscribed);
+              break;
+            }
+            setToken('');
+            setStep(Step.Token);
+            break;
+          case Step.Token:
+            await emailConfirmationForSubscribe(currentToken);
+            dispatch(setUserSubscribed(true));
+            justSubscribed.current = true;
+            setStep(Step.Subscribed);
+            break;
+          default:
+            break;
+        }
+      } catch (err) {
+        setError(extractErrorMessageFromResponse(err, intl));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [setLoading, setError, setStep, step, emailAddress, token, dispatch, intl]
+  );
+
+  const handleChangeEmail = useCallback((e: Event) => {
+    const { value } = e.target as HTMLInputElement;
+
+    e.preventDefault();
+    setError(null);
+    setEmailAddress(value);
+  }, []);
+
+  const handleChangeToken = useCallback(
+    (e: Event) => {
+      const { value } = e.target as HTMLInputElement;
+
+      e.preventDefault();
+      setError(null);
+
+      try {
+        if (value.length > 0 && isJwtExpired(value)) {
+          setError(intl.formatMessage(messages.expiredToken));
+        } else {
+          sendForm(value);
+        }
+      } catch (e) {}
+
+      setToken(value);
+    },
+    [sendForm, setError, setToken, intl]
+  );
+
+  const handleSubmit = useCallback(
+    async (e: Event) => {
+      e.preventDefault();
+      sendForm();
+    },
+    [sendForm]
+  );
+
+  const isValidEmailAddress = emailRegexp.test(emailAddress);
+
+  const setEmailStep = useCallback(() => {
+    setError(null);
+    setStep(Step.Email);
+  }, [setStep]);
+
+  const handleUnsubscribe = useCallback(async () => {
+    setLoading(true);
+    try {
+      await unsubscribeFromEmailUpdates();
+      dispatch(setUserSubscribed(false));
+      setStep(Step.Unsubscribed);
+    } catch (err) {
+      setError(extractErrorMessageFromResponse(err, intl));
+    } finally {
+      setLoading(false);
+    }
+  }, [setLoading, setStep, setError, dispatch, intl]);
+
+  if (step === Step.Subscribed) {
+    const text = justSubscribed.current
+      ? intl.formatMessage(messages.haveSubscribed)
+      : intl.formatMessage(messages.subscribed);
+
+    return (
+      <div className={styles.subscribed}>
+        {text}
+        <Button kind="primary" size="middle" className={styles.button} theme={theme} onClick={handleUnsubscribe}>
+          <FormattedMessage id="subscribeByEmail.unsubscribe" defaultMessage="Unsubscribe" />
+        </Button>
+      </div>
+    );
+  }
+
+  if (step === Step.Unsubscribed) {
+    return (
+      <div className={styles.unsubscribed}>
+        <FormattedMessage
+          id="subscribeByEmail.have-been-unsubscribed"
+          defaultMessage="You have unsubscribed from email updates"
+        />
+        <Button kind="primary" size="middle" className={styles.button} theme={theme} onClick={close}>
+          <FormattedMessage id="subscribeByEmail.close" defaultMessage="Close" />
+        </Button>
+      </div>
+    );
+  }
+
+  const buttonLabel =
+    step === Step.Email ? intl.formatMessage(messages.submit) : intl.formatMessage(messages.subscribe);
+
+  return (
+    <form
+      className={clsx(styles.root, theme === 'dark' ? styles.themeDark : styles.themeLight)}
+      onSubmit={handleSubmit}
+    >
+      {step === Step.Email && renderEmailPart(loading, intl, emailAddress, handleChangeEmail)}
+      {step === Step.Token && renderTokenPart(loading, intl, token, handleChangeToken, setEmailStep)}
+      {error !== null && (
+        <div className={styles.error} role="alert">
+          {error}
+        </div>
+      )}
+      <Button
+        className={styles.button}
+        kind="primary"
+        size="large"
+        type="submit"
+        disabled={!isValidEmailAddress || loading}
+      >
+        {loading ? <Preloader className={styles.preloader} /> : buttonLabel}
+      </Button>
+    </form>
+  );
+};
+
+export const SubscribeByEmail: FunctionComponent = () => {
+  const theme = useTheme();
+  const intl = useIntl();
+  const user = useSelector<StoreState, User | null>(({ user }) => user);
+  const isAnonymous = isUserAnonymous(user);
+  const buttonTitle = intl.formatMessage(isAnonymous ? messages.onlyRegisteredUsers : messages.subscribeByEmail);
+
+  return (
+    <Dropdown title={intl.formatMessage(messages.email)} theme={theme} disabled={isAnonymous} buttonTitle={buttonTitle}>
+      <SubscribeByEmailForm />
+    </Dropdown>
+  );
+};

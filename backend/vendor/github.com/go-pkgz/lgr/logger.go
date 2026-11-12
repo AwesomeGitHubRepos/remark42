@@ -2,6 +2,7 @@
 // The logger's output can be customized in 2 ways:
 //   - by setting individual formatting flags, i.e. lgr.New(lgr.Msec, lgr.CallerFunc)
 //   - by passing formatting template, i.e. lgr.New(lgr.Format(lgr.Short))
+//
 // Leveled output works for messages based on text prefix, i.e. Logf("INFO some message") means INFO level.
 // Debug and trace levels can be filtered based on lgr.Trace and lgr.Debug options.
 // ERROR, FATAL and PANIC levels send to err as well. FATAL terminate caller application with os.Exit(1)
@@ -10,8 +11,10 @@ package lgr
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path"
 	"regexp"
@@ -43,24 +46,28 @@ const (
 var secretReplacement = []byte("******")
 
 var (
-	reTraceDefault = regexp.MustCompile(`.*/lgr/logger\.go.*\n`)
+	// match function names because source directories vary between builds
+	reTraceDefault = regexp.MustCompile(`(?m)^.*github\.com/go-pkgz/lgr\.\(\*Logger\)\.(?:logf|Logf)\([^\n]*\n[^\n]*\n`)
 	reTraceStd     = regexp.MustCompile(`.*/log/log\.go.*\n`)
 )
 
 // Logger provided simple logger with basic support of levels. Thread safe
 type Logger struct {
 	// set with Option calls
-	stdout, stderr io.Writer // destination writes for out and err
-	dbg            bool      // allows reporting for DEBUG level
-	trace          bool      // allows reporting for TRACE and DEBUG levels
-	callerFile     bool      // reports caller file with line number, i.e. foo/bar.go:89
-	callerFunc     bool      // reports caller function name, i.e. bar.myFunc
-	callerPkg      bool      // reports caller package name
-	levelBraces    bool      // encloses level with [], i.e. [INFO]
-	callerDepth    int       // how many stack frames to skip, relative to the real (reported) frame
-	format         string    // layout template
-	secrets        [][]byte  // sub-strings to secrets by matching
-	mapper         Mapper    // map (alter) output based on levels
+	stdout, stderr io.Writer    // destination writes for out and err
+	sameStream     bool         // stdout and stderr are the same stream
+	dbg            bool         // allows reporting for DEBUG level
+	trace          bool         // allows reporting for TRACE and DEBUG levels
+	callerFile     bool         // reports caller file with line number, i.e. foo/bar.go:89
+	callerFunc     bool         // reports caller function name, i.e. bar.myFunc
+	callerPkg      bool         // reports caller package name
+	levelBraces    bool         // encloses level with [], i.e. [INFO]
+	callerDepth    int          // how many stack frames to skip, relative to the real (reported) frame
+	format         string       // layout template
+	secrets        secretSet    // sub-strings to hide in this logger's output
+	shared         *secretSet   // package-level secrets hidden in addition to own ones, nil for loggers made by New
+	mapper         Mapper       // map (alter) output based on levels
+	slogHandler    slog.Handler // optional slog handler to delegate logging
 
 	// internal use
 	now           nowFn
@@ -128,6 +135,8 @@ func New(options ...Option) *Logger {
 	res.callerOn = strings.Contains(res.format, "{{.Caller") || res.callerFile || res.callerFunc || res.callerPkg
 	res.levelBracesOn = strings.Contains(res.format, "[{{.Level}}]") || res.levelBraces
 
+	res.sameStream = isStreamsSame(res.stdout, res.stderr)
+
 	return &res
 }
 
@@ -140,7 +149,7 @@ func (l *Logger) Logf(format string, args ...interface{}) {
 	l.logf(format, args...)
 }
 
-//nolint gocyclo
+// nolint gocyclo
 func (l *Logger) logf(format string, args ...interface{}) {
 
 	var lv, msg string
@@ -154,6 +163,34 @@ func (l *Logger) logf(format string, args ...interface{}) {
 		return
 	}
 	if lv == "TRACE" && !l.trace {
+		return
+	}
+
+	// hide secrets in the message itself, covers slog handler and panic dump paths
+	// as well as the formatted line redacted later in this function.
+	// reuse both snapshots so the message and the final line use the same secrets
+	own, shared := l.secrets.list(), l.shared.list()
+	if len(own)+len(shared) > 0 {
+		msg = string(own.hide([]byte(msg), shared))
+	}
+
+	// if slog handler is set, use it
+	if l.slogHandler != nil {
+		// get the caller's PC so slog handlers can resolve source info when AddSource is enabled
+		var pcs [1]uintptr
+		runtime.Callers(3+l.callerDepth, pcs[:]) // skip runtime.Callers, logf, Logf (+ any extra depth)
+		record := slog.NewRecord(l.now(), stringToLevel(lv), msg, pcs[0])
+		_ = l.slogHandler.Handle(context.Background(), record)
+
+		// handle FATAL and PANIC levels as they have special behavior
+		if lv == "FATAL" || lv == "PANIC" {
+			if lv == "PANIC" {
+				// print panic stack trace
+				stack := getDump()
+				_, _ = l.stderr.Write([]byte(fmt.Sprintf("\n*** PANIC: %s\n\n%s", msg, stack)))
+			}
+			l.fatal()
+		}
 		return
 	}
 
@@ -189,7 +226,7 @@ func (l *Logger) logf(format string, args ...interface{}) {
 		data = bytes.Replace(data, []byte("[WARN ]"), []byte("[WARN] "), 1)
 		data = bytes.Replace(data, []byte("[INFO ]"), []byte("[INFO] "), 1)
 	}
-	data = l.hideSecrets(data)
+	data = own.hide(data, shared)
 
 	l.lock.Lock()
 	_, _ = l.stdout.Write(data)
@@ -197,7 +234,7 @@ func (l *Logger) logf(format string, args ...interface{}) {
 	// write to err as well for high levels, exit(1) on fatal and panic and dump stack on panic level
 	switch lv {
 	case "ERROR":
-		if l.stderr != l.stdout {
+		if !l.sameStream {
 			_, _ = l.stderr.Write(data)
 		}
 		if l.errorDump {
@@ -210,12 +247,12 @@ func (l *Logger) logf(format string, args ...interface{}) {
 			}
 		}
 	case "FATAL":
-		if l.stderr != l.stdout {
+		if !l.sameStream {
 			_, _ = l.stderr.Write(data)
 		}
 		l.fatal()
 	case "PANIC":
-		if l.stderr != l.stdout {
+		if !l.sameStream {
 			_, _ = l.stderr.Write(data)
 		}
 		_, _ = l.stderr.Write(getDump())
@@ -225,11 +262,16 @@ func (l *Logger) logf(format string, args ...interface{}) {
 	l.lock.Unlock()
 }
 
-func (l *Logger) hideSecrets(data []byte) []byte {
-	for _, h := range l.secrets {
-		data = bytes.Replace(data, h, secretReplacement, -1)
-	}
-	return data
+// AddSecrets adds values to hide in this logger's output. Safe to call while other goroutines log.
+// Empty and whitespace-only values are ignored.
+func (l *Logger) AddSecrets(vals ...string) {
+	l.secrets.add(vals...)
+}
+
+// RemoveSecrets stops hiding values in this logger's output, the ones set by Secret option too.
+// Package-level secrets are not affected.
+func (l *Logger) RemoveSecrets(vals ...string) {
+	l.secrets.remove(vals...)
 }
 
 type callerInfo struct {
@@ -300,12 +342,17 @@ func (l *Logger) formatWithOptions(elems layout) (res string) {
 
 	parts := make([]string, 0, 4)
 
+	dt := orElse(l.msec,
+		func() string { return elems.DT.Format("2006/01/02 15:04:05.000") },
+		func() string { return elems.DT.Format("2006/01/02 15:04:05") },
+	)
+	if l.mapper.TimeFunc != nil {
+		dt = l.mapper.TimeFunc(dt)
+	}
+
 	parts = append(
 		parts,
-		l.mapper.TimeFunc(orElse(l.msec,
-			func() string { return elems.DT.Format("2006/01/02 15:04:05.000") },
-			func() string { return elems.DT.Format("2006/01/02 15:04:05") },
-		)),
+		dt,
 		l.levelMapper(elems.Level)(orElse(l.levelBraces,
 			func() string { return `[` + elems.Level + `]` },
 			func() string { return elems.Level },
@@ -404,4 +451,22 @@ func getDump() []byte {
 		length = maxSize
 	}
 	return stacktrace[:length]
+}
+
+// isStreamsSame checks if two streams are the same by comparing file which they refer to
+func isStreamsSame(s1, s2 io.Writer) bool {
+	s1File, outOk := s1.(*os.File)
+	s2File, errOk := s2.(*os.File)
+	if outOk && errOk {
+		outStat, err := s1File.Stat()
+		if err != nil {
+			return false
+		}
+		errStat, err := s2File.Stat()
+		if err != nil {
+			return false
+		}
+		return os.SameFile(outStat, errStat)
+	}
+	return s1 == s2
 }

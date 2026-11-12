@@ -1,11 +1,13 @@
 package image
 
 import (
+	"bytes"
 	"context"
-	"io/ioutil"
+	"fmt"
 	"os"
 	"path"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -40,7 +42,6 @@ func TestBoltStore_SaveCommit(t *testing.T) {
 		return nil
 	})
 	assert.NoError(t, err)
-
 }
 
 func TestBoltStore_LoadAfterSave(t *testing.T) {
@@ -60,48 +61,104 @@ func TestBoltStore_LoadAfterSave(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestBoltStore_Cleanup(t *testing.T) {
+func TestBoltStore_LoadedDataSurvivesLaterWrites(t *testing.T) {
 	svc, teardown := prepareBoltImageStorageTest(t)
 	defer teardown()
 
-	save := func(file string) (id string) {
-		err := svc.Save(file, gopherPNGBytes())
-		require.NoError(t, err)
-
-		checkBoltImgData(t, svc.db, imagesStagedBktName, file, func(data []byte) error {
-			require.NotNil(t, data)
-			assert.Equal(t, 1462, len(data))
-			return nil
-		})
-		return file
-	}
-
-	// save 3 images to staging
-	img1 := save("blah_ff1.png")
-	img1ts := time.Now()
-	time.Sleep(100 * time.Millisecond)
-	img2 := save("blah_ff2.png")
-	time.Sleep(100 * time.Millisecond)
-	img3 := save("blah_ff3.png")
-
-	err := svc.Cleanup(context.Background(), time.Since(img1ts)) // clean first images
-	assert.NoError(t, err)
-
-	assertBoltImgNil(t, svc.db, imagesStagedBktName, img1)
-	assertBoltImgNil(t, svc.db, imagesBktName, img1)
-	assertBoltImgNotNil(t, svc.db, imagesStagedBktName, img2)
-	assertBoltImgNotNil(t, svc.db, imagesStagedBktName, img3)
-
-	err = svc.Commit(img3)
+	// the image is large enough to take its own overflow pages, which bolt reuses once it's deleted,
+	// and the later saves write enough of the same size to reuse them
+	const imageSize, laterSaves = 8192, 50
+	orig := bytes.Repeat([]byte("A"), imageSize)
+	require.NoError(t, svc.Save("u/first", orig))
+	got, err := svc.Load("u/first")
 	require.NoError(t, err)
 
-	err = svc.Cleanup(context.Background(), time.Millisecond*10)
+	require.NoError(t, svc.Delete("u/first"))
+	for i := range laterSaves {
+		require.NoError(t, svc.Save(fmt.Sprintf("u/other%d", i), bytes.Repeat([]byte("C"), imageSize)))
+	}
+	assert.True(t, bytes.Equal(orig, got), "loaded image changed after later writes to the store, %d bytes starting with %q",
+		len(got), got[:min(16, len(got))])
+}
+
+func TestBoltStore_LoadAfterDelete(t *testing.T) {
+	svc, teardown := prepareBoltImageStorageTest(t)
+	defer teardown()
+
+	// delete image from permanent storage
+	id := "test_img"
+	err := svc.Save(id, gopherPNGBytes())
 	assert.NoError(t, err)
 
-	assertBoltImgNil(t, svc.db, imagesStagedBktName, img2)
-	assertBoltImgNil(t, svc.db, imagesBktName, img2)
-	assertBoltImgNotNil(t, svc.db, imagesBktName, img3)
+	err = svc.Commit(id)
+	require.NoError(t, err)
+
+	err = svc.Delete(id)
 	assert.NoError(t, err)
+
+	_, err = svc.Load(id)
+	assert.Error(t, err)
+
+	// delete staging image
+	id = "staging_img"
+	err = svc.Save(id, gopherPNGBytes())
+	assert.NoError(t, err)
+
+	err = svc.Delete(id)
+	assert.NoError(t, err)
+
+	_, err = svc.Load(id)
+	assert.Error(t, err)
+}
+
+func TestBoltStore_Cleanup(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		svc, teardown := prepareBoltImageStorageTest(t)
+		defer teardown()
+
+		save := func(file string) (id string) {
+			err := svc.Save(file, gopherPNGBytes())
+			require.NoError(t, err)
+
+			checkBoltImgData(t, svc.db, imagesStagedBktName, file, func(data []byte) error {
+				require.NotNil(t, data)
+				assert.Equal(t, 1462, len(data))
+				return nil
+			})
+			return file
+		}
+
+		// save 3 images to staging
+		img1 := save("blah_ff1.png")
+		img1ts := time.Now()
+		time.Sleep(100 * time.Millisecond)
+		img2 := save("blah_ff2.png")
+		time.Sleep(100 * time.Millisecond)
+		img3 := save("blah_ff3.png")
+
+		// Cleanup check is `age > ttl` (strict), so pick a ttl strictly less than img1's age
+		err := svc.Cleanup(context.Background(), time.Since(img1ts)-time.Millisecond)
+		assert.NoError(t, err)
+
+		assertBoltImgNil(t, svc.db, imagesStagedBktName, img1)
+		assertBoltImgNil(t, svc.db, imagesBktName, img1)
+		assertBoltImgNotNil(t, svc.db, imagesStagedBktName, img2)
+		assertBoltImgNotNil(t, svc.db, imagesStagedBktName, img3)
+
+		err = svc.Commit(img3)
+		require.NoError(t, err)
+
+		// reset the time to cleanup
+		err = svc.ResetCleanupTimer(img2)
+		require.NoError(t, err)
+		err = svc.Cleanup(context.Background(), time.Millisecond*100)
+		assert.NoError(t, err)
+
+		assertBoltImgNotNil(t, svc.db, imagesStagedBktName, img2)
+		assertBoltImgNil(t, svc.db, imagesBktName, img2)
+		assertBoltImgNotNil(t, svc.db, imagesBktName, img3)
+		assert.NoError(t, err)
+	})
 }
 
 func TestBolt_Info(t *testing.T) {
@@ -148,7 +205,7 @@ func checkBoltImgData(t *testing.T, db *bolt.DB, bucket, id string, callback fun
 }
 
 func prepareBoltImageStorageTest(t *testing.T) (svc *Bolt, teardown func()) {
-	loc, err := ioutil.TempDir("", "test_image_r42")
+	loc, err := os.MkdirTemp("", "test_image_r42")
 	require.NoError(t, err, "failed to make temp dir")
 
 	svc, err = NewBoltStorage(path.Join(loc, "picture.db"), bolt.Options{})

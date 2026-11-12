@@ -1,0 +1,108 @@
+// Package sender provides email sender
+package sender
+
+import (
+	"context"
+	"time"
+
+	"github.com/go-pkgz/auth/v2/logger"
+	"github.com/go-pkgz/email"
+)
+
+// Email implements sender interface for VerifyHandler
+// Uses common subject line and "from" for all messages
+type Email struct {
+	EmailParams
+	logger.L
+	sender *email.Sender
+}
+
+// EmailParams  with all needed to make new Email client with smtp
+type EmailParams struct {
+	Host        string // SMTP host
+	Port        int    // SMTP port
+	HELOHost    string // SMTP HELO/EHLO hostname, defaults to localhost when unset
+	From        string // from email field
+	Subject     string // email subject
+	ContentType string // content type
+
+	TLS                bool          // TLS auth
+	StartTLS           bool          // startTLS auth
+	InsecureSkipVerify bool          // skip certificate verification
+	Charset            string        // character set
+	LoginAuth          bool          // LOGIN auth method instead of default PLAIN, needed for Office 365 and outlook.com
+	SMTPUserName       string        // username
+	SMTPPassword       string        // password
+	TimeOut            time.Duration // TCP connection timeout
+}
+
+// NewEmailClient creates email client
+func NewEmailClient(emailParams EmailParams, l logger.L) *Email {
+	var opts []email.Option
+
+	if emailParams.SMTPUserName != "" {
+		opts = append(opts, email.Auth(emailParams.SMTPUserName, emailParams.SMTPPassword))
+	}
+
+	if emailParams.ContentType != "" {
+		opts = append(opts, email.ContentType(emailParams.ContentType))
+	}
+
+	if emailParams.Charset != "" {
+		opts = append(opts, email.Charset(emailParams.Charset))
+	}
+
+	if emailParams.LoginAuth {
+		opts = append(opts, email.LoginAuth())
+	}
+
+	if emailParams.Port != 0 {
+		opts = append(opts, email.Port(emailParams.Port))
+	}
+
+	if emailParams.HELOHost != "" {
+		opts = append(opts, email.HELOHost(emailParams.HELOHost))
+	}
+
+	if emailParams.TimeOut != 0 {
+		opts = append(opts, email.TimeOut(emailParams.TimeOut))
+	}
+
+	if emailParams.TLS {
+		opts = append(opts, email.TLS(true))
+	}
+
+	if emailParams.StartTLS {
+		opts = append(opts, email.STARTTLS(true))
+	}
+
+	if emailParams.InsecureSkipVerify {
+		opts = append(opts, email.InsecureSkipVerify(true))
+	}
+
+	sender := email.NewSender(emailParams.Host, opts...)
+
+	return &Email{EmailParams: emailParams, L: l, sender: sender}
+}
+
+// Send email with given text, with no cancellation and with TimeOut applied to the connection setup only.
+// See SendContext for the details.
+func (e *Email) Send(to, text string) error {
+	return e.SendContext(context.Background(), to, text)
+}
+
+// SendContext sends email with given text and terminates the whole SMTP transaction as soon as ctx is done.
+// TimeOut covers the connection setup only, so without a context a server accepting the connection and
+// stalling afterwards blocks the caller for as long as it likes.
+//
+// The body is not logged: confirmation emails sent by the verify provider contain a one-shot magic-link
+// token, and any party with log access could redeem it before the user does. Logging only the recipient
+// and body length keeps the line useful for operators without leaking the credential.
+func (e *Email) SendContext(ctx context.Context, to, text string) error {
+	e.Logf("[DEBUG] send %d-byte message to %s", len(text), to)
+	return e.sender.SendContext(ctx, text, email.Params{
+		From:    e.From,
+		To:      []string{to},
+		Subject: e.Subject,
+	})
+}

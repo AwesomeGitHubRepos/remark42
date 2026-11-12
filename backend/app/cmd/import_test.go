@@ -1,26 +1,29 @@
 package cmd
 
 import (
+	"encoding/base64"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
-	"time"
 
 	log "github.com/go-pkgz/lgr"
-	"github.com/umputun/go-flags"
-
+	"github.com/jessevdk/go-flags"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestImport_Execute(t *testing.T) {
-
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, r.URL.Path, "/api/v1/admin/import")
 		assert.Equal(t, "POST", r.Method)
-		body, err := ioutil.ReadAll(r.Body)
+		t.Logf("Authorization header: %+v", r.Header.Get("Authorization"))
+		auth, err := base64.StdEncoding.DecodeString(strings.Split(r.Header.Get("Authorization"), " ")[1])
+		require.NoError(t, err)
+		assert.Equal(t, "admin:secret", string(auth))
+		body, err := io.ReadAll(r.Body)
 		assert.NoError(t, err)
 		assert.Equal(t, "blah\nblah2\n12345678\n", string(body))
 
@@ -48,8 +51,43 @@ func TestImport_Execute(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestImport_ExecuteFailed(t *testing.T) {
+func TestImport_ExecuteNoPassword(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, r.URL.Path, "/api/v1/admin/import")
+		assert.Equal(t, "POST", r.Method)
+		t.Logf("Authorization header: %+v", r.Header.Get("Authorization"))
+		auth, err := base64.StdEncoding.DecodeString(strings.Split(r.Header.Get("Authorization"), " ")[1])
+		require.NoError(t, err)
+		assert.Equal(t, "admin:", string(auth))
+		body, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		assert.Equal(t, "blah\nblah2\n12345678\n", string(body))
 
+		w.WriteHeader(401)
+		fmt.Fprint(w, "Unauthorized")
+	}))
+	defer ts.Close()
+
+	cmd := ImportCommand{}
+	cmd.SetCommon(CommonOpts{RemarkURL: ts.URL})
+
+	p := flags.NewParser(&cmd, flags.Default)
+	_, err := p.ParseArgs([]string{"--site=remark", "--file=testdata/import.txt"})
+	require.NoError(t, err)
+	err = cmd.Execute(nil)
+	assert.EqualError(t, err, "error response \"401 Unauthorized\", ensure you have set ADMIN_PASSWD and provided it to the command you're running: Unauthorized")
+
+	cmd = ImportCommand{}
+	cmd.SetCommon(CommonOpts{RemarkURL: ts.URL})
+
+	p = flags.NewParser(&cmd, flags.Default)
+	_, err = p.ParseArgs([]string{"--site=remark", "--file=testdata/import.txt.gz"})
+	require.NoError(t, err)
+	err = cmd.Execute(nil)
+	assert.EqualError(t, err, "error response \"401 Unauthorized\", ensure you have set ADMIN_PASSWD and provided it to the command you're running: Unauthorized")
+}
+
+func TestImport_ExecuteFailed(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, r.URL.Path, "/api/v1/admin/import")
 		assert.Equal(t, "POST", r.Method)
@@ -94,16 +132,14 @@ func TestImport_ExecuteFailed(t *testing.T) {
 }
 
 func TestImport_ExecuteTimeout(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, r.URL.Path, "/api/v1/admin/import")
 		assert.Equal(t, "POST", r.Method)
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		assert.NoError(t, err)
 		assert.Equal(t, "blah\nblah2\n12345678\n", string(body))
-		time.Sleep(500 * time.Millisecond)
-		fmt.Fprintln(w, "some response")
-		fmt.Fprintln(w, string(body))
-
+		// hold the response until the client gives up on its own timeout
+		<-r.Context().Done()
 	}))
 	defer ts.Close()
 

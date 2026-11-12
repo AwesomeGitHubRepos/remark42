@@ -7,8 +7,9 @@
 package accessor
 
 import (
+	"fmt"
+
 	log "github.com/go-pkgz/lgr"
-	"github.com/pkg/errors"
 
 	"github.com/umputun/remark42/backend/app/store/admin"
 )
@@ -34,7 +35,8 @@ func NewMemAdminStore(key string) *MemAdmin {
 	return &MemAdmin{data: map[string]AdminRec{}, key: key}
 }
 
-// Key executes find by siteID and returns substructure with secret key
+// Key supposed to execute find by siteID and returns substructure with secret key,
+// but in this case the shared secret is used for all sites
 func (m *MemAdmin) Key(_ string) (key string, err error) {
 	return m.key, nil
 }
@@ -43,7 +45,7 @@ func (m *MemAdmin) Key(_ string) (key string, err error) {
 func (m *MemAdmin) Admins(siteID string) (ids []string, err error) {
 	resp, ok := m.data[siteID]
 	if !ok {
-		return nil, errors.Errorf("site %s not found", siteID)
+		return nil, fmt.Errorf("site %s not found", siteID)
 	}
 	log.Printf("[DEBUG] admins for %s, %+v", siteID, resp.IDs)
 	return resp.IDs, nil
@@ -53,7 +55,7 @@ func (m *MemAdmin) Admins(siteID string) (ids []string, err error) {
 func (m *MemAdmin) Email(siteID string) (email string, err error) {
 	resp, ok := m.data[siteID]
 	if !ok {
-		return "", errors.Errorf("site %s not found", siteID)
+		return "", fmt.Errorf("site %s not found", siteID)
 	}
 
 	return resp.Email, nil
@@ -63,7 +65,7 @@ func (m *MemAdmin) Email(siteID string) (email string, err error) {
 func (m *MemAdmin) Enabled(siteID string) (ok bool, err error) {
 	resp, ok := m.data[siteID]
 	if !ok {
-		return false, errors.Errorf("site %s not found", siteID)
+		return false, fmt.Errorf("site %s not found", siteID)
 	}
 	return resp.Enabled, nil
 }
@@ -72,7 +74,7 @@ func (m *MemAdmin) Enabled(siteID string) (ok bool, err error) {
 func (m *MemAdmin) OnEvent(siteID string, ev admin.EventType) error {
 	resp, ok := m.data[siteID]
 	if !ok {
-		return errors.Errorf("site %s not found", siteID)
+		return fmt.Errorf("site %s not found", siteID)
 	}
 	if ev == admin.EvCreate {
 		resp.CountCreated++ // not a good idea, just for demo

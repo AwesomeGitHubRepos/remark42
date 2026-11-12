@@ -1,0 +1,143 @@
+package provider
+
+import (
+	"crypto/rand"
+	"crypto/sha1"
+	"fmt"
+	"net"
+	"net/http"
+	"slices"
+	"strings"
+
+	"github.com/go-pkgz/auth/v2/avatar"
+	"github.com/go-pkgz/auth/v2/token"
+)
+
+// localBindAddr returns the listen address for the dev oauth and custom-server
+// helpers. Both servers are intended for local development and embedded
+// flows; the historical default ":port" listened on every interface, which
+// silently exposed the dev OAuth UI to anyone on the LAN. Default the bind
+// to 127.0.0.1; callers that explicitly want a non-loopback bind can pass
+// a hostname (e.g. "0.0.0.0" or a specific IP) via Provider.Host (dev) or
+// the URL host (custom-server).
+func localBindAddr(host, port string) string {
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port)
+}
+
+const (
+	urlLoginSuffix    = "/login"
+	urlCallbackSuffix = "/callback"
+	urlLogoutSuffix   = "/logout"
+)
+
+// Service represents oauth2 provider. Adds Handler method multiplexing login, auth and logout requests
+type Service struct {
+	Provider
+}
+
+// NewService makes service for given provider
+func NewService(p Provider) Service {
+	return Service{Provider: p}
+}
+
+// AvatarSaver defines minimal interface to save avatar
+type AvatarSaver interface {
+	Put(u token.User, client *http.Client) (avatarURL string, err error)
+}
+
+// TokenService defines interface accessing tokens
+type TokenService interface {
+	Parse(tokenString string) (claims token.Claims, err error)
+	Set(w http.ResponseWriter, claims token.Claims) (token.Claims, error)
+	Get(r *http.Request) (claims token.Claims, token string, err error)
+	Reset(w http.ResponseWriter)
+}
+
+// Provider defines interface for auth handler
+type Provider interface {
+	Name() string
+	LoginHandler(w http.ResponseWriter, r *http.Request)
+	AuthHandler(w http.ResponseWriter, r *http.Request)
+	LogoutHandler(w http.ResponseWriter, r *http.Request)
+}
+
+// Handler dispatches login, callback, and logout requests to the underlying provider.
+func (p Service) Handler(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if strings.HasSuffix(r.URL.Path, urlLoginSuffix) {
+		p.LoginHandler(w, r)
+		return
+	}
+	if strings.HasSuffix(r.URL.Path, urlCallbackSuffix) {
+		p.AuthHandler(w, r)
+		return
+	}
+	if strings.HasSuffix(r.URL.Path, urlLogoutSuffix) {
+		p.LogoutHandler(w, r)
+		return
+	}
+	w.WriteHeader(http.StatusNotFound)
+}
+
+func userDataLogSummary(data UserData) string {
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return fmt.Sprintf("keys=%v", keys)
+}
+
+func userLogSummary(u token.User) string {
+	attrs := make([]string, 0, len(u.Attributes))
+	for k := range u.Attributes {
+		attrs = append(attrs, k)
+	}
+	slices.Sort(attrs)
+	return fmt.Sprintf("id=%q name=%q picture=%t email=%t attrs=%v role=%t audience=%t",
+		u.ID, u.Name, u.Picture != "", u.Email != "", attrs, u.Role != "", u.Audience != "")
+}
+
+// setAvatar saves avatar and puts proxied URL to u.Picture
+func setAvatar(ava AvatarSaver, u token.User, client *http.Client) (token.User, error) {
+	if ava == nil || ava == (*avatar.Proxy)(nil) {
+		return u, nil // empty AvatarSaver ok, just skipped
+	}
+	avatarURL, e := ava.Put(u, client)
+	if e != nil {
+		return u, fmt.Errorf("failed to save avatar for: %w", e)
+	}
+	u.Picture = avatarURL
+	return u, nil
+}
+
+// sessionOnlyFromRequest reads the session-only flag from the request. Both "session",
+// as documented in README, and "sess", accepted by the direct and verify providers since
+// the beginning, are honored.
+func sessionOnlyFromRequest(r *http.Request) bool {
+	for _, name := range []string{"session", "sess"} {
+		if v := r.URL.Query().Get(name); v != "" {
+			return v != "0"
+		}
+	}
+	return false
+}
+
+func randToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("can't get random: %w", err)
+	}
+	s := sha1.New()
+	if _, err := s.Write(b); err != nil {
+		return "", fmt.Errorf("can't write randoms to sha1: %w", err)
+	}
+	return fmt.Sprintf("%x", s.Sum(nil)), nil
+}

@@ -7,12 +7,10 @@
 package accessor
 
 import (
-	"log"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
-
-	"github.com/pkg/errors"
 
 	"github.com/umputun/remark42/backend/app/store"
 	"github.com/umputun/remark42/backend/app/store/engine"
@@ -25,7 +23,7 @@ type MemData struct {
 	posts     map[string][]store.Comment // key is siteID
 	metaUsers map[string]metaUser        // key is userID
 	metaPosts map[store.Locator]metaPost // key is post's locator
-	sync.RWMutex
+	mu        sync.RWMutex
 }
 
 type metaPost struct {
@@ -58,15 +56,15 @@ func NewMemData() *MemData {
 func (m *MemData) Create(comment store.Comment) (commentID string, err error) {
 
 	if ro, e := m.Flag(engine.FlagRequest{Flag: engine.ReadOnly, Locator: comment.Locator}); e == nil && ro {
-		return "", errors.Errorf("post %s is read-only", comment.Locator.URL)
+		return "", fmt.Errorf("post %s is read-only", comment.Locator.URL)
 	}
 
-	m.Lock()
-	defer m.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	comments := m.posts[comment.Locator.SiteID]
 	for _, c := range comments { // don't allow duplicated IDs
 		if c.ID == comment.ID {
-			return "", errors.New("dup key")
+			return "", fmt.Errorf("dup key")
 		}
 	}
 	comments = append(comments, comment)
@@ -76,8 +74,8 @@ func (m *MemData) Create(comment store.Comment) (commentID string, err error) {
 
 // Find returns all comments for post and sorts results
 func (m *MemData) Find(req engine.FindRequest) (comments []store.Comment, err error) {
-	m.RLock()
-	defer m.RUnlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	comments = []store.Comment{}
 
@@ -132,22 +130,22 @@ func (m *MemData) Find(req engine.FindRequest) (comments []store.Comment, err er
 
 // Get returns comment for locator.URL and commentID string
 func (m *MemData) Get(req engine.GetRequest) (comment store.Comment, err error) {
-	m.RLock()
-	defer m.RUnlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.get(req.Locator, req.CommentID)
 }
 
 // Update updates comment for locator.URL with mutable part of comment
 func (m *MemData) Update(comment store.Comment) error {
-	m.Lock()
-	defer m.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.updateComment(comment)
 }
 
 // Count returns number of comments for post or user
 func (m *MemData) Count(req engine.FindRequest) (count int, err error) {
-	m.RLock()
-	defer m.RUnlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	switch {
 	case req.Locator.URL != "": // comment's count for post
@@ -161,14 +159,14 @@ func (m *MemData) Count(req engine.FindRequest) (count int, err error) {
 		})
 		return len(comments), nil
 	default:
-		return 0, errors.Errorf("invalid count request %+v", req)
+		return 0, fmt.Errorf("invalid count request %+v", req)
 	}
 }
 
 // Info get post(s) meta info
 func (m *MemData) Info(req engine.InfoRequest) (res []store.PostInfo, err error) {
-	m.RLock()
-	defer m.RUnlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	res = []store.PostInfo{}
 
 	if req.Locator.URL != "" { // post info
@@ -176,7 +174,7 @@ func (m *MemData) Info(req engine.InfoRequest) (res []store.PostInfo, err error)
 			return c.Locator == req.Locator
 		})
 		if len(comments) == 0 {
-			return nil, errors.New("not found")
+			return nil, fmt.Errorf("not found")
 		}
 		info := store.PostInfo{
 			URL:      req.Locator.URL,
@@ -235,13 +233,13 @@ func (m *MemData) Info(req engine.InfoRequest) (res []store.PostInfo, err error)
 		return res, nil
 	}
 
-	return nil, errors.Errorf("invalid info request %+v", req)
+	return nil, fmt.Errorf("invalid info request %+v", req)
 }
 
 // Flag sets and gets flag values
 func (m *MemData) Flag(req engine.FlagRequest) (val bool, err error) {
-	m.Lock()
-	defer m.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	if req.Update == engine.FlagNonSet { // read flag value, no update requested
 		return m.checkFlag(req), nil
@@ -252,23 +250,22 @@ func (m *MemData) Flag(req engine.FlagRequest) (val bool, err error) {
 
 // ListFlags get list of flagged keys, like blocked & verified user
 // works for full locator (post flags) or with userID
-func (m *MemData) ListFlags(req engine.FlagRequest) (res []interface{}, err error) {
-	m.RLock()
-	defer m.RUnlock()
+func (m *MemData) ListFlags(req engine.FlagRequest) (res []any, err error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
-	res = []interface{}{}
+	res = []any{}
 
 	switch req.Flag {
 	case engine.Verified:
 		for _, u := range m.metaUsers {
-			if u.SiteID == req.Locator.SiteID {
+			if u.SiteID == req.Locator.SiteID && u.Verified {
 				res = append(res, u.UserID)
 			}
 		}
 		return res, nil
 
 	case engine.Blocked:
-		log.Printf("%+v", m.metaUsers)
 		for _, u := range m.metaUsers {
 			if u.SiteID == req.Locator.SiteID && u.Blocked && u.BlockedUntil.After(time.Now()) {
 				res = append(res, store.BlockedUser{ID: u.UserID, Until: u.BlockedUntil})
@@ -277,7 +274,7 @@ func (m *MemData) ListFlags(req engine.FlagRequest) (res []interface{}, err erro
 		return res, nil
 	}
 
-	return nil, errors.Errorf("flag %s not listable", req.Flag)
+	return nil, fmt.Errorf("flag %s not listable", req.Flag)
 }
 
 // UserDetail sets or gets single detail value, or gets all details fo§r requested site.
@@ -285,42 +282,43 @@ func (m *MemData) ListFlags(req engine.FlagRequest) (res []interface{}, err erro
 // and all site's details listing under the same function (and not to extend engine interface by two separate functions).
 func (m *MemData) UserDetail(req engine.UserDetailRequest) ([]engine.UserDetailEntry, error) {
 	switch req.Detail {
-	case engine.UserEmail:
+	case engine.UserEmail, engine.UserTelegram:
 		if req.UserID == "" {
-			return nil, errors.New("userid cannot be empty in request for single detail")
+			return nil, fmt.Errorf("userid cannot be empty in request for single detail")
 		}
 
-		m.Lock()
-		defer m.Unlock()
+		m.mu.Lock()
+		defer m.mu.Unlock()
 
 		if req.Update == "" { // read detail value, no update requested
-			return m.getUserDetail(req)
+			return m.getUserDetail(req), nil
 		}
 
-		return m.setUserDetail(req)
+		return m.setUserDetail(req), nil
 	case engine.AllUserDetails:
 		// list of all details returned in case request is a read request
 		// (Update is not set) and does not have UserID or Detail set
 		if req.Update == "" && req.UserID == "" { // read list of all details
-			m.Lock()
-			defer m.Unlock()
-			return m.listDetails(req.Locator)
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			return m.listDetails(req.Locator), nil
 		}
-		return nil, errors.New("unsupported request with userdetail all")
+		return nil, fmt.Errorf("unsupported request with userdetail all")
 	default:
-		return nil, errors.Errorf("unsupported detail %q", req.Detail)
+		return nil, fmt.Errorf("unsupported detail %q", req.Detail)
 	}
 }
 
 // Delete post(s), user, comment, user details, or everything
 func (m *MemData) Delete(req engine.DeleteRequest) error {
 
-	m.Lock()
-	defer m.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	switch {
 	case req.UserDetail != "": // delete user detail
-		return m.deleteUserDetail(req.Locator, req.UserID, req.UserDetail)
+		m.deleteUserDetail(req.Locator, req.UserID, req.UserDetail)
+		return nil
 	case req.Locator.URL != "" && req.CommentID != "" && req.UserDetail == "": // delete comment
 		return m.deleteComment(req.Locator, req.CommentID, req.DeleteMode)
 
@@ -333,17 +331,18 @@ func (m *MemData) Delete(req engine.DeleteRequest) error {
 				return e
 			}
 		}
-		return m.deleteUserDetail(req.Locator, req.UserID, engine.AllUserDetails)
+		m.deleteUserDetail(req.Locator, req.UserID, engine.AllUserDetails)
+		return nil
 
 	case req.Locator.SiteID != "" && req.Locator.URL == "" && req.CommentID == "" && req.UserID == "" && req.UserDetail == "": // delete site
 		if _, ok := m.posts[req.Locator.SiteID]; !ok {
-			return errors.New("not found")
+			return fmt.Errorf("not found")
 		}
 		m.posts[req.Locator.SiteID] = []store.Comment{}
 		return nil
 	}
 
-	return errors.Errorf("invalid delete request %+v", req)
+	return fmt.Errorf("invalid delete request %+v", req)
 }
 
 func (m *MemData) deleteComment(loc store.Locator, id string, mode store.DeleteMode) error {
@@ -352,7 +351,7 @@ func (m *MemData) deleteComment(loc store.Locator, id string, mode store.DeleteM
 		return c.Locator == loc && c.ID == id
 	})
 	if len(comments) == 0 {
-		return errors.New("not found")
+		return fmt.Errorf("not found")
 	}
 
 	comments[0].SetDeleted(mode)
@@ -388,12 +387,17 @@ func (m *MemData) checkFlag(req engine.FlagRequest) (val bool) {
 	return false
 }
 
+// userMeta returns the stored meta of the user on the site, or a new one, so a flag change keeps the other fields
+func (m *MemData) userMeta(userID, siteID string) metaUser {
+	if meta, ok := m.metaUsers[userID]; ok && meta.SiteID == siteID {
+		return meta
+	}
+	return metaUser{UserID: userID, SiteID: siteID, Details: engine.UserDetailEntry{UserID: userID}}
+}
+
 func (m *MemData) setFlag(req engine.FlagRequest) (res bool, err error) {
 
-	status := false
-	if req.Update == engine.FlagTrue {
-		status = true
-	}
+	status := req.Update == engine.FlagTrue
 
 	switch req.Flag {
 
@@ -405,20 +409,14 @@ func (m *MemData) setFlag(req engine.FlagRequest) (res bool, err error) {
 				until = time.Now().Add(req.TTL)
 			}
 		}
-		meta := metaUser{
-			UserID:       req.UserID,
-			SiteID:       req.Locator.SiteID,
-			Blocked:      status,
-			BlockedUntil: until,
-		}
+		meta := m.userMeta(req.UserID, req.Locator.SiteID)
+		meta.Blocked = status
+		meta.BlockedUntil = until
 		m.metaUsers[req.UserID] = meta
 
 	case engine.Verified:
-		meta := metaUser{
-			UserID:   req.UserID,
-			SiteID:   req.Locator.SiteID,
-			Verified: status,
-		}
+		meta := m.userMeta(req.UserID, req.Locator.SiteID)
+		meta.Verified = status
 		m.metaUsers[req.UserID] = meta
 
 	case engine.ReadOnly:
@@ -430,32 +428,37 @@ func (m *MemData) setFlag(req engine.FlagRequest) (res bool, err error) {
 		info.ReadOnly = status
 		m.metaPosts[req.Locator] = info
 	}
-	return status, errors.Wrapf(err, "failed to set flag %+v", req)
+	if err != nil {
+		return false, fmt.Errorf("failed to set flag %+v: %w", req, err)
+	}
+	return status, nil
 }
 
 // getUserDetail returns UserDetailEntry with requested userDetail (omitting other details)
 // as an only element of the slice.
-func (m *MemData) getUserDetail(req engine.UserDetailRequest) ([]engine.UserDetailEntry, error) {
+func (m *MemData) getUserDetail(req engine.UserDetailRequest) []engine.UserDetailEntry {
 	if meta, ok := m.metaUsers[req.UserID]; ok {
 		if meta.SiteID != req.Locator.SiteID {
-			return []engine.UserDetailEntry{}, nil
+			return []engine.UserDetailEntry{}
 		}
 		switch req.Detail {
 		case engine.UserEmail:
-			return []engine.UserDetailEntry{{UserID: req.UserID, Email: meta.Details.Email}}, nil
+			return []engine.UserDetailEntry{{UserID: req.UserID, Email: meta.Details.Email}}
+		case engine.UserTelegram:
+			return []engine.UserDetailEntry{{UserID: req.UserID, Telegram: meta.Details.Telegram}}
 		}
 	}
 
-	return []engine.UserDetailEntry{}, nil
+	return []engine.UserDetailEntry{}
 }
 
 // setUserDetail sets requested userDetail, returning complete updated UserDetailEntry as an onlyIps
 // element of the slice in case of success
-func (m *MemData) setUserDetail(req engine.UserDetailRequest) ([]engine.UserDetailEntry, error) {
+func (m *MemData) setUserDetail(req engine.UserDetailRequest) []engine.UserDetailEntry {
 	var entry metaUser
 	if meta, ok := m.metaUsers[req.UserID]; ok {
 		if meta.SiteID != req.Locator.SiteID {
-			return []engine.UserDetailEntry{}, nil
+			return []engine.UserDetailEntry{}
 		}
 		entry = meta
 	}
@@ -472,43 +475,49 @@ func (m *MemData) setUserDetail(req engine.UserDetailRequest) ([]engine.UserDeta
 	case engine.UserEmail:
 		entry.Details.Email = req.Update
 		m.metaUsers[req.UserID] = entry
-		return []engine.UserDetailEntry{{UserID: req.UserID, Email: req.Update}}, nil
+		return []engine.UserDetailEntry{{UserID: req.UserID, Email: req.Update}}
+	case engine.UserTelegram:
+		entry.Details.Telegram = req.Update
+		m.metaUsers[req.UserID] = entry
+		return []engine.UserDetailEntry{{UserID: req.UserID, Telegram: req.Update}}
 	}
 
-	return []engine.UserDetailEntry{}, nil
+	return []engine.UserDetailEntry{}
 }
 
 // listDetails lists all available users details for given siteID
-func (m *MemData) listDetails(loc store.Locator) ([]engine.UserDetailEntry, error) {
+func (m *MemData) listDetails(loc store.Locator) []engine.UserDetailEntry {
 	var res []engine.UserDetailEntry
 	for _, u := range m.metaUsers {
 		if u.SiteID == loc.SiteID {
 			res = append(res, u.Details)
 		}
 	}
-	return res, nil
+	return res
 }
 
 // deleteUserDetail deletes requested UserDetail or whole UserDetailEntry,
 // deletion of the absent entry doesn't produce error.
 // Trying to delete user with wrong siteID doesn't to anything and doesn't produce error.
-func (m *MemData) deleteUserDetail(locator store.Locator, userID string, userDetail engine.UserDetail) error {
+func (m *MemData) deleteUserDetail(locator store.Locator, userID string, userDetail engine.UserDetail) {
 	var entry metaUser
 	if meta, ok := m.metaUsers[userID]; ok {
 		if meta.SiteID != locator.SiteID {
-			return nil
+			return
 		}
 		entry = meta
 	}
 
 	if entry == (metaUser{}) || entry.Details == (engine.UserDetailEntry{}) {
 		// absent entry means that we should not do anything
-		return nil
+		return
 	}
 
 	switch userDetail {
 	case engine.UserEmail:
 		entry.Details.Email = ""
+	case engine.UserTelegram:
+		entry.Details.Telegram = ""
 	case engine.AllUserDetails:
 		entry.Details = engine.UserDetailEntry{UserID: userID}
 	}
@@ -519,7 +528,6 @@ func (m *MemData) deleteUserDetail(locator store.Locator, userID string, userDet
 	}
 
 	m.metaUsers[userID] = entry
-	return nil
 }
 
 func (m *MemData) get(loc store.Locator, commentID string) (store.Comment, error) {
@@ -527,7 +535,7 @@ func (m *MemData) get(loc store.Locator, commentID string) (store.Comment, error
 		return c.Locator == loc && c.ID == commentID
 	})
 	if len(comments) == 0 {
-		return store.Comment{}, errors.New("not found")
+		return store.Comment{}, fmt.Errorf("not found")
 	}
 	return comments[0], nil
 }
@@ -549,7 +557,7 @@ func (m *MemData) updateComment(comment store.Comment) error {
 		m.posts[comment.Locator.SiteID] = comments
 		return nil
 	}
-	return errors.New("not found")
+	return fmt.Errorf("not found")
 }
 
 func (m *MemData) match(comments []store.Comment, fn func(c store.Comment) bool) (res []store.Comment) {

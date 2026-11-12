@@ -2,16 +2,16 @@ package api
 
 import (
 	"crypto/tls"
+	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
-	"github.com/go-chi/chi"
-	"github.com/go-chi/chi/middleware"
 	log "github.com/go-pkgz/lgr"
-	"golang.org/x/crypto/acme/autocert"
-
 	R "github.com/go-pkgz/rest"
+	"github.com/go-pkgz/routegroup"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 // sslMode defines ssl mode for rest server
@@ -40,13 +40,13 @@ type SSLConfig struct {
 
 // httpToHTTPSRouter creates new router which does redirect from http to https server
 // with default middlewares. Used in 'static' ssl mode.
-func (s *Rest) httpToHTTPSRouter() chi.Router {
-	log.Printf("[DEBUG] create https-to-http redirect routes")
-	router := chi.NewRouter()
-	router.Use(middleware.RealIP, R.Recoverer(log.Default()))
-	router.Use(middleware.Throttle(1000), middleware.Timeout(60*time.Second))
+func (s *Rest) httpToHTTPSRouter() http.Handler {
+	log.Printf("[DEBUG] create http-to-https redirect routes")
+	router := routegroup.New(http.NewServeMux())
+	router.Use(R.Recoverer(log.Default()))
+	router.Use(R.Throttle(1000), R.Timeout(60*time.Second))
 
-	router.Handle("/*", s.redirectHandler())
+	router.Handle("/", s.redirectHandler())
 	return router
 }
 
@@ -54,24 +54,43 @@ func (s *Rest) httpToHTTPSRouter() chi.Router {
 // with default middlewares. This part is necessary to obtain certificate from LE.
 // If it receives not a acme challenge it performs redirect to https server.
 // Used in 'auto' ssl mode.
-func (s *Rest) httpChallengeRouter(m *autocert.Manager) chi.Router {
+func (s *Rest) httpChallengeRouter(m *autocert.Manager) http.Handler {
 	log.Printf("[DEBUG] create http-challenge routes")
-	router := chi.NewRouter()
-	router.Use(middleware.RealIP, R.Recoverer(log.Default()))
-	router.Use(middleware.Throttle(1000), middleware.Timeout(60*time.Second))
+	router := routegroup.New(http.NewServeMux())
+	router.Use(R.Recoverer(log.Default()))
+	router.Use(R.Throttle(1000), R.Timeout(60*time.Second))
 
-	router.Handle("/*", m.HTTPHandler(s.redirectHandler()))
+	router.Handle("/", m.HTTPHandler(s.redirectHandler()))
 	return router
 }
 
 func (s *Rest) redirectHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		newURL := s.RemarkURL + r.URL.Path
-		if r.URL.RawQuery != "" {
-			newURL += "?" + r.URL.RawQuery
+		newURL, err := s.redirectURL(r)
+		if err != nil {
+			log.Printf("[WARN] failed to build redirect URL, %s", err)
+			http.Error(w, "invalid redirect URL", http.StatusInternalServerError)
+			return
 		}
 		http.Redirect(w, r, newURL, http.StatusTemporaryRedirect)
 	})
+}
+
+func (s *Rest) redirectURL(r *http.Request) (string, error) {
+	baseURL, err := url.Parse(s.RemarkURL)
+	if err != nil {
+		return "", fmt.Errorf("parse remark URL: %w", err)
+	}
+	if baseURL.Scheme != "http" && baseURL.Scheme != "https" || baseURL.Host == "" {
+		return "", fmt.Errorf("remark URL must be absolute HTTP(S) URL")
+	}
+
+	basePath := strings.TrimRight(baseURL.Path, "/")
+	requestPath := "/" + strings.TrimLeft(r.URL.Path, "/")
+	baseURL.Path = basePath + requestPath
+	baseURL.RawQuery = r.URL.RawQuery
+	baseURL.Fragment = ""
+	return baseURL.String(), nil
 }
 
 func (s *Rest) makeAutocertManager() *autocert.Manager {
@@ -84,8 +103,8 @@ func (s *Rest) makeAutocertManager() *autocert.Manager {
 }
 
 // makeHTTPSAutoCertServer makes https server with autocert mode (LE support)
-func (s *Rest) makeHTTPSAutocertServer(port int, router http.Handler, m *autocert.Manager) *http.Server {
-	server := s.makeHTTPServer(port, router)
+func (s *Rest) makeHTTPSAutocertServer(address string, port int, router http.Handler, m *autocert.Manager) *http.Server {
+	server := s.makeHTTPServer(address, port, router)
 	cfg := s.makeTLSConfig()
 	cfg.GetCertificate = m.GetCertificate
 	server.TLSConfig = cfg
@@ -93,8 +112,8 @@ func (s *Rest) makeHTTPSAutocertServer(port int, router http.Handler, m *autocer
 }
 
 // makeHTTPSServer makes https server for static mode
-func (s *Rest) makeHTTPSServer(port int, router http.Handler) *http.Server {
-	server := s.makeHTTPServer(port, router)
+func (s *Rest) makeHTTPSServer(address string, port int, router http.Handler) *http.Server {
+	server := s.makeHTTPServer(address, port, router)
 	server.TLSConfig = s.makeTLSConfig()
 	return server
 }
@@ -111,15 +130,11 @@ func (s *Rest) getRemarkHost() string {
 
 func (s *Rest) makeTLSConfig() *tls.Config {
 	return &tls.Config{
-		PreferServerCipherSuites: true,
 		CipherSuites: []uint16{
 			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			// tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-			// tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
 			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			// tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
 		},
 		MinVersion: tls.VersionTLS12,
 		CurvePreferences: []tls.CurveID{

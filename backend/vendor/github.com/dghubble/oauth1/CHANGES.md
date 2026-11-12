@@ -4,6 +4,27 @@ Notable changes between releases.
 
 ## Latest
 
+## v0.7.3
+
+* Percent encode special characters in HMAC-SHA1 secrets ([#72](https://github.com/dghubble/oauth1/pull/72))
+* Strip whitespace from request token body ([#56](https://github.com/dghubble/oauth1/pull/56))
+* Update Go module dependencies
+
+## v0.7.2
+
+* Update minimum Go version from v1.17 to v1.18 ([#66](https://github.com/dghubble/oauth1/pull/66))
+
+## v0.7.1
+
+* Show body when `RequestToken` or `AccessToken` requests return an invalid status code ([#54](https://github.com/dghubble/oauth1/pull/54))
+
+## v0.7.0
+
+* Add an `HMAC256Signer` ([#40](https://github.com/dghubble/oauth1/pull/40))
+* Add discogs `Endpoint` ([#39](https://github.com/dghubble/oauth1/pull/39))
+* Allow custom `Noncer` for unusual OAuth1 providers ([#45](https://github.com/dghubble/oauth1/pull/45)
+* Change tumblr `Endpoint` URLs to https ([#37](https://github.com/dghubble/oauth1/pull/37))
+
 ## v0.6.0
 
 * Add Go module support ([#32](https://github.com/dghubble/oauth1/pull/32))

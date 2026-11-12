@@ -1,0 +1,404 @@
+import '@testing-library/jest-dom';
+
+import { fireEvent, waitFor, screen } from '@testing-library/preact';
+import { render } from 'tests/utils';
+
+import type { OAuthProvider, User } from 'common/types';
+import { StaticStore } from 'common/static-store';
+import { BASE_URL } from 'common/constants.config';
+import * as userActions from 'store/user/actions';
+import * as postMessage from 'utils/post-message';
+
+import { Auth } from './auth';
+import * as utils from './auth.utils';
+import * as api from './auth.api';
+import { getProviderData } from './components/oauth.utils';
+
+window.open = jest.fn();
+
+describe('<Auth/>', () => {
+  let defaultProviders = StaticStore.config.auth_providers;
+
+  afterAll(() => {
+    StaticStore.config.auth_providers = defaultProviders;
+  });
+
+  // the embedding page posts into the widget with iframe.contentWindow.postMessage, which
+  // arrives with source set to the parent. jsdom leaves source unset on window.postMessage,
+  // so it is set here explicitly
+  function postFromParent(data: unknown) {
+    window.dispatchEvent(new MessageEvent('message', { data, source: window.parent }));
+  }
+
+  // TODO: separate tests of `useDropdown` mechanics with the hook
+  describe('useDropdown', () => {
+    it('should render auth with hidden dropdown', () => {
+      const { container } = render(<Auth />);
+
+      expect(container.querySelector('.auth-dropdown')).not.toBeInTheDocument();
+    });
+
+    it('should close dropdown by click on button', () => {
+      const { container } = render(<Auth />);
+
+      expect(container.querySelector('.auth-dropdown')).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByText('Sign in'));
+      expect(container.querySelector('.auth-dropdown')).toBeInTheDocument();
+
+      fireEvent.click(screen.getByText('Sign in'));
+      expect(container.querySelector('.auth-dropdown')).not.toBeInTheDocument();
+    });
+
+    it('should not close dropdown by clickOutside message from a foreign source', async () => {
+      const { container } = render(<Auth />);
+
+      fireEvent.click(screen.getByText('Sign in'));
+      expect(container.querySelector('.auth-dropdown')).toBeInTheDocument();
+
+      window.dispatchEvent(new MessageEvent('message', { data: { clickOutside: true }, source: null }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(container.querySelector('.auth-dropdown')).toBeInTheDocument();
+    });
+
+    it('should close dropdown by clickOutside message from parent', async () => {
+      const { container } = render(<Auth />);
+
+      expect(container.querySelector('.auth-dropdown')).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByText('Sign in'));
+      expect(container.querySelector('.auth-dropdown')).toBeInTheDocument();
+
+      postFromParent({ clickOutside: true });
+      await waitFor(() => expect(container.querySelector('.auth-dropdown')).not.toBeInTheDocument());
+    });
+
+    it.each([
+      ['title', { title: 'New title' }],
+      ['hash', { hash: '#comment-1' }],
+      ['theme', { theme: 'dark' }],
+      ['an unparsable payload', 'clickOutside'],
+    ])('should not close dropdown by %s message from parent', async (_, message) => {
+      const { container } = render(<Auth />);
+
+      fireEvent.click(screen.getByText('Sign in'));
+      expect(container.querySelector('.auth-dropdown')).toBeInTheDocument();
+
+      postFromParent(message);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(container.querySelector('.auth-dropdown')).toBeInTheDocument();
+    });
+
+    // the panel is positioned absolutely, so it grows the iframe without growing the document:
+    // the parent is told a height nothing else will ever correct, and closing the panel resizes
+    // no box either observer watches. a close that reports nothing leaves the iframe at the open
+    // panel's height, which is a hole in the embedding page under the widget
+    it('should report the height when the dropdown closes', async () => {
+      const updateIframeHeight = jest.spyOn(postMessage, 'updateIframeHeight');
+      const { container } = render(<Auth />);
+
+      fireEvent.click(screen.getByText('Sign in'));
+      expect(container.querySelector('.auth-dropdown')).toBeInTheDocument();
+
+      updateIframeHeight.mockClear();
+      fireEvent.click(document);
+      expect(container.querySelector('.auth-dropdown')).not.toBeInTheDocument();
+
+      // with no element, so the height is the document's own and not the panel that just went
+      await waitFor(() => expect(updateIframeHeight).toHaveBeenCalledWith());
+    });
+  });
+
+  it.each([
+    [[]],
+    [['dev']],
+    [['customoidc']],
+    [['facebook', 'google']],
+    [['facebook', 'google', 'microsoft']],
+    [['facebook', 'google', 'microsoft', 'yandex']],
+    [['facebook', 'google', 'microsoft', 'yandex', 'twitter']],
+    [['facebook', 'google', 'microsoft', 'yandex', 'twitter', 'apple']],
+  ] as [OAuthProvider[]][])('should renders with %j providers', async (providers) => {
+    StaticStore.config.auth_providers = providers;
+
+    const { container } = render(<Auth />);
+
+    expect(container.querySelector('.auth-dropdown')).not.toBeInTheDocument();
+
+    expect(screen.getByText('Sign in')).toHaveClass('auth-button');
+    fireEvent.click(screen.getByText('Sign in'));
+    expect(container.querySelector('.auth-dropdown')).toBeInTheDocument();
+    providers.forEach((p) => {
+      const { name } = getProviderData(p, 'light');
+      expect(screen.getByTitle(`Sign in with ${name}`)).toBeInTheDocument();
+    });
+    expect(screen.queryByPlaceholderText('Name')).not.toBeInTheDocument();
+    expect(screen.queryByText('Confirm')).not.toBeInTheDocument();
+  });
+
+  it('should render email provider', () => {
+    StaticStore.config.auth_providers = ['email'];
+
+    render(<Auth />);
+
+    fireEvent.click(screen.getByText('Sign in'));
+    expect(screen.getByText('email')).toHaveClass('auth-form-title');
+    expect(screen.getByPlaceholderText('Name')).toHaveClass('auth-input-username');
+    expect(screen.getByPlaceholderText('Email address')).toHaveClass('auth-input-email');
+    expect(screen.getByText('Confirm')).toHaveClass('auth-submit');
+  });
+
+  it('should render anonymous provider', () => {
+    StaticStore.config.auth_providers = ['anonymous'];
+
+    render(<Auth />);
+
+    fireEvent.click(screen.getByText('Sign in'));
+    expect(screen.getByText('anonymous')).toHaveClass('auth-form-title');
+    expect(screen.getByPlaceholderText('Name')).toHaveClass('auth-input-username');
+    expect(screen.getByText('Confirm')).toHaveClass('auth-submit');
+  });
+
+  it('should render tabs with two form providers', () => {
+    StaticStore.config.auth_providers = ['email', 'anonymous'];
+
+    render(<Auth />);
+
+    fireEvent.click(screen.getByText('Sign in'));
+    expect(screen.getByDisplayValue('email')).toHaveAttribute('id', 'form-provider-email');
+    expect(screen.getByText('email')).toHaveAttribute('for', 'form-provider-email');
+    expect(screen.getByText('email')).toHaveClass('auth-tabs-item');
+    expect(screen.getByDisplayValue('anonymous')).toHaveAttribute('id', 'form-provider-anonymous');
+    expect(screen.getByText('anonym')).toHaveAttribute('for', 'form-provider-anonymous');
+    expect(screen.getByText('anonym')).toHaveClass('auth-tabs-item');
+    expect(screen.getByPlaceholderText('Name')).toHaveClass('auth-input-username');
+    expect(screen.getByText('Confirm')).toHaveClass('auth-submit');
+
+    fireEvent.click(screen.getByLabelText('email'));
+    expect(screen.getByPlaceholderText('Name')).toHaveClass('auth-input-username');
+    expect(screen.getByPlaceholderText('Email address')).toHaveClass('auth-input-email');
+    expect(screen.getByText('Confirm')).toHaveClass('auth-submit');
+  });
+
+  it('should send email and then verify forms', async () => {
+    StaticStore.config.auth_providers = ['email'];
+    jest.spyOn(api, 'emailSignin').mockImplementationOnce(async () => null);
+    jest.spyOn(api, 'verifyEmailSignin').mockImplementationOnce(async () => ({}) as User);
+    jest.spyOn(utils, 'getTokenInvalidReason').mockImplementationOnce(() => null);
+    jest.spyOn(utils, 'persistEmail').mockImplementationOnce(jest.fn());
+
+    render(<Auth />);
+
+    fireEvent.click(screen.getByText('Sign in'));
+    fireEvent.change(screen.getByPlaceholderText('Name'), { target: { value: 'username' } });
+    fireEvent.change(screen.getByPlaceholderText('Email address'), {
+      target: { value: 'email@email.com' },
+    });
+    fireEvent.click(screen.getByText('Confirm'));
+
+    expect(screen.getByRole('presentation')).toHaveClass('spinner');
+    await waitFor(() => expect(api.emailSignin).toHaveBeenCalled());
+    expect(api.emailSignin).toHaveBeenCalledWith('email@email.com', 'username');
+
+    expect(screen.getByText('Back')).toHaveClass('auth-back-button');
+    expect(screen.getByTitle('Close sign-in dropdown')).toHaveClass('auth-close-button');
+    expect(screen.getByPlaceholderText('Paste the token from the email')).toHaveClass('auth-token-textarea');
+
+    fireEvent.change(screen.getByPlaceholderText('Paste the token from the email'), {
+      target: { value: 'token' },
+    });
+
+    fireEvent.click(screen.getByText('Confirm'));
+
+    await waitFor(() => expect(api.verifyEmailSignin).toHaveBeenCalled());
+    expect(api.verifyEmailSignin).toHaveBeenCalledWith('token');
+    expect(utils.persistEmail).toHaveBeenCalledWith('email@email.com');
+  });
+
+  it('should show validation error for token', async () => {
+    StaticStore.config.auth_providers = ['email'];
+    const emailSignin = jest.spyOn(api, 'emailSignin').mockImplementationOnce(async () => null);
+
+    const { getByText, getByTitle, getByPlaceholderText } = render(<Auth />);
+
+    fireEvent.click(getByText('Sign in'));
+    fireEvent.change(getByPlaceholderText('Name'), { target: { value: 'username' } });
+    fireEvent.change(getByPlaceholderText('Email address'), {
+      target: { value: 'email@email.com' },
+    });
+    fireEvent.click(getByText('Confirm'));
+    await waitFor(() => expect(emailSignin).toHaveBeenCalled());
+
+    expect(getByText('Back')).toHaveClass('auth-back-button');
+    expect(getByTitle('Close sign-in dropdown')).toHaveClass('auth-close-button');
+    expect(getByPlaceholderText('Paste the token from the email')).toHaveClass('auth-token-textarea');
+
+    fireEvent.change(getByPlaceholderText('Paste the token from the email'), { target: { value: 'token' } });
+    fireEvent.click(getByText('Confirm'));
+    await waitFor(() => expect(utils.getTokenInvalidReason).toHaveBeenCalled());
+
+    expect(utils.getTokenInvalidReason).toHaveBeenCalledWith('token');
+
+    await waitFor(() => expect(getByText('Token is invalid')).toBeInTheDocument());
+    expect(getByText('Token is invalid')).toHaveClass('auth-error');
+  });
+
+  it('should send anonym form', async () => {
+    StaticStore.config.auth_providers = ['anonymous'];
+    jest.spyOn(api, 'anonymousSignin').mockImplementationOnce(async () => ({}) as User);
+
+    render(<Auth />);
+
+    fireEvent.click(screen.getByText('Sign in'));
+    fireEvent.change(screen.getByPlaceholderText('Name'), { target: { value: 'username' } });
+    fireEvent.click(screen.getByText('Confirm'));
+    expect(screen.getByRole('presentation')).toHaveClass('spinner');
+    expect(screen.getByRole('presentation')).toHaveAttribute('aria-label', 'Loading...');
+    await waitFor(() => expect(api.anonymousSignin).toHaveBeenCalled());
+  });
+
+  it.each`
+    value           | expected
+    ${'username '}  | ${'username'}
+    ${' username'}  | ${'username'}
+    ${' username '} | ${'username'}
+  `('should remove spaces in the first/last position in username', async ({ value, expected }) => {
+    StaticStore.config.auth_providers = ['email'];
+
+    render(<Auth />);
+    fireEvent.click(screen.getByText('Sign in'));
+
+    const input = screen.getByPlaceholderText('Name');
+
+    fireEvent.change(input, { target: { value } });
+    input.focus();
+    input.blur();
+
+    expect(input).toHaveValue(expected);
+  });
+
+  it.each`
+    value            | expected
+    ${'user name '}  | ${'user name'}
+    ${' user name'}  | ${'user name'}
+    ${' user name '} | ${'user name'}
+  `('should leave spaces in the middle of username', ({ value, expected }) => {
+    StaticStore.config.auth_providers = ['email'];
+
+    render(<Auth />);
+
+    fireEvent.click(screen.getByText('Sign in'));
+
+    const input = screen.getByPlaceholderText('Name');
+
+    fireEvent.change(input, { target: { value } });
+    input.focus();
+    input.blur();
+
+    expect(input).toHaveValue(expected);
+  });
+
+  it('should show error when no auth providers are configured', () => {
+    StaticStore.config.auth_providers = [];
+
+    const { container } = render(<Auth />);
+
+    fireEvent.click(screen.getByText('Sign in'));
+    expect(container.querySelector('.auth-error')).toBeInTheDocument();
+  });
+
+  it('should not show error when auth providers are configured', () => {
+    StaticStore.config.auth_providers = ['google'];
+
+    const { container } = render(<Auth />);
+
+    fireEvent.click(screen.getByText('Sign in'));
+    expect(container.querySelector('.auth-error')).not.toBeInTheDocument();
+  });
+
+  describe('OAuth providers', () => {
+    it('should not set user if unauthorized', async () => {
+      StaticStore.config.auth_providers = ['google'];
+
+      const setUser = jest.spyOn(userActions, 'setUser').mockImplementation(jest.fn());
+      const oauthSignin = jest.spyOn(api, 'oauthSignin').mockImplementation(async () => null);
+
+      render(<Auth />);
+      fireEvent.click(screen.getByText('Sign in'));
+      await waitFor(() => fireEvent.click(screen.getByTitle('Sign in with Google')));
+      await waitFor(() =>
+        expect(oauthSignin).toHaveBeenCalledWith(
+          `${BASE_URL}/auth/google/login?from=http%3A%2F%2Flocalhost%2F%3FselfClose&site=remark`
+        )
+      );
+      expect(setUser).toHaveBeenCalledTimes(0);
+      expect(screen.getByText('Sign in')).toBeInTheDocument();
+    });
+
+    it('should set user if authorized', async () => {
+      StaticStore.config.auth_providers = ['google'];
+
+      const user = { name: 'UserName1' } as User;
+      const setUser = jest.spyOn(userActions, 'setUser').mockImplementation(jest.fn());
+      const oauthSignin = jest.spyOn(api, 'oauthSignin').mockImplementation(async () => user);
+
+      render(<Auth />);
+
+      fireEvent.click(screen.getByText('Sign in'));
+      await waitFor(() => fireEvent.click(screen.getByTitle('Sign in with Google')));
+
+      await waitFor(() =>
+        expect(oauthSignin).toHaveBeenCalledWith(
+          `${BASE_URL}/auth/google/login?from=http%3A%2F%2Flocalhost%2F%3FselfClose&site=remark`
+        )
+      );
+      expect(setUser).toHaveBeenCalledWith(user);
+    });
+
+    it('should use custom provider route', async () => {
+      StaticStore.config.auth_providers = ['customoidc'];
+
+      const oauthSignin = jest.spyOn(api, 'oauthSignin').mockImplementation(async () => null);
+
+      render(<Auth />);
+
+      fireEvent.click(screen.getByText('Sign in'));
+      await waitFor(() => fireEvent.click(screen.getByTitle('Sign in with Customoidc')));
+
+      await waitFor(() =>
+        expect(oauthSignin).toHaveBeenCalledWith(
+          `${BASE_URL}/auth/customoidc/login?from=http%3A%2F%2Flocalhost%2F%3FselfClose&site=remark`
+        )
+      );
+    });
+  });
+
+  describe('Telegram auth', () => {
+    it('should go through the auth flow', async () => {
+      StaticStore.config.auth_providers = ['telegram'];
+
+      const user = { name: 'UserName1' } as User;
+      const getTelegramSigninParams = jest
+        .spyOn(api, 'getTelegramSigninParams')
+        .mockImplementationOnce(async () => ({ bot: 'botid', token: 'tokentokentoken' }));
+      const verifyTelegramSignin = jest.spyOn(api, 'verifyTelegramSignin').mockImplementationOnce(async () => user);
+      const setUser = jest.spyOn(userActions, 'setUser').mockImplementation(jest.fn());
+      render(<Auth />);
+
+      fireEvent.click(screen.getByText('Sign in'));
+      fireEvent.click(screen.getByTitle('Sign in with Telegram'));
+      await waitFor(() => expect(getTelegramSigninParams).toHaveBeenCalledTimes(1));
+      const telegramLink = screen.getByText('using this link').getAttribute('href');
+      expect(typeof telegramLink === 'string').toBe(true);
+      const telegramUrl = new URL(telegramLink as string);
+      expect(telegramUrl.origin).toBe('https://t.me');
+      expect(telegramUrl.searchParams.get('start')).toBe('tokentokentoken');
+      expect(telegramUrl.pathname.startsWith(`/botid`)).toBeTruthy();
+      fireEvent.click(screen.getByText('Check'));
+      await waitFor(() => expect(verifyTelegramSignin).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(setUser).toHaveBeenCalledWith(user));
+    });
+  });
+});

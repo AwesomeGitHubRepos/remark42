@@ -1,0 +1,372 @@
+import { h, Component, Fragment } from 'preact';
+import { useSelector } from 'store/context';
+import clsx from 'clsx';
+
+import type { IntlShape } from 'common/intl';
+import { useIntl, FormattedMessage, defineMessages } from 'common/intl';
+import { getDirection } from 'common/direction';
+import 'styles/global.css';
+import type { StoreState } from 'store';
+import { COMMENT_NODE_CLASSNAME_PREFIX, MAX_SHOWN_ROOT_COMMENTS, IS_MOBILE } from 'common/constants';
+import { maxShownComments, noFooter, url } from 'common/settings';
+
+import {
+  fetchUser,
+  blockUser,
+  unblockUser,
+  fetchBlockedUsers,
+  hideUser,
+  unhideUser,
+  signout,
+} from 'store/user/actions';
+import { fetchComments, addComment, updateComment } from 'store/comments/actions';
+import { setCommentsReadOnlyState } from 'store/post-info/actions';
+
+// TODO: make this button as default for all cases and replace current `components/Button`
+import { Button } from 'components/auth/components/button';
+import { Preloader } from 'components/preloader';
+import { Settings } from 'components/settings';
+import { AuthPanel } from 'components/auth-panel';
+import { SortPicker } from 'components/sort-picker';
+import { CommentForm } from 'components/comment-form';
+import { Thread } from 'components/thread';
+import { ConnectedComment as Comment } from 'components/comment/connected-comment';
+import { uploadImage, getPreview } from 'common/api';
+import { isUserAnonymous } from 'utils/isUserAnonymous';
+import { bindActions } from 'utils/actionBinder';
+import { postMessageToParent, parseMessage, isFromParent, updateIframeHeight } from 'utils/post-message';
+import { useActions } from 'hooks/useAction';
+import { setCollapse } from 'store/thread/actions';
+
+import styles from './root.module.css';
+
+const mapStateToProps = (state: StoreState) => ({
+  sort: state.comments.sort,
+  isCommentsLoading: state.comments.isFetching,
+  user: state.user,
+  childToParentComments: Object.entries(state.comments.childComments).reduce(
+    (accumulator: Record<string, string>, [key, children]) => {
+      children.forEach((child) => (accumulator[child] = key));
+      return accumulator;
+    },
+    {}
+  ),
+  collapsedThreads: state.collapsedThreads,
+  topComments: state.comments.topComments,
+  pinnedComments: state.comments.pinnedComments.map((id) => state.comments.allComments[id]).filter((c) => !c.hidden),
+  theme: state.theme,
+  info: state.info,
+  hiddenUsers: state.hiddenUsers,
+  blockedUsers: state.bannedUsers,
+  getPreview,
+  uploadImage,
+});
+
+const boundActions = bindActions({
+  fetchComments,
+  fetchUser,
+  fetchBlockedUsers,
+  setCommentsReadOnlyState,
+  blockUser,
+  unblockUser,
+  hideUser,
+  unhideUser,
+  addComment,
+  updateComment,
+  setCollapse,
+  signout,
+});
+
+type Props = ReturnType<typeof mapStateToProps> & typeof boundActions & { intl: IntlShape };
+
+interface State {
+  isUserLoading: boolean;
+  isSettingsVisible: boolean;
+  commentsShown: number;
+  wasSomeoneUnblocked: boolean;
+}
+
+const messages = defineMessages({
+  pinnedComments: {
+    id: 'root.pinned-comments',
+    defaultMessage: 'Pinned comments',
+  },
+});
+
+const getCollapsedParent = (hash: string, childToParentComments: Record<string, string>) => {
+  let id = hash.replace(`#${COMMENT_NODE_CLASSNAME_PREFIX}`, '');
+  while (childToParentComments[id]) {
+    id = childToParentComments[id];
+  }
+
+  return id;
+};
+
+/** main component fr main comments widget */
+export class Root extends Component<Props, State> {
+  state = {
+    isUserLoading: true,
+    commentsShown: maxShownComments,
+    wasSomeoneUnblocked: false,
+    isSettingsVisible: false,
+  };
+
+  heightObserver: ResizeObserver | null = null;
+  heightFallbackTimeout: number | null = null;
+
+  startHeightReporting = () => {
+    if (this.heightObserver) {
+      return;
+    }
+
+    updateIframeHeight();
+    this.heightObserver = new ResizeObserver(() => updateIframeHeight());
+    this.heightObserver.observe(document.body);
+  };
+
+  componentDidMount() {
+    // if the user fetch hangs, report the preloader height anyway so the parent page
+    // is not left with an unbounded iframe
+    this.heightFallbackTimeout = window.setTimeout(this.startHeightReporting, 5000);
+
+    const userloading = this.props.fetchUser().finally(() =>
+      // start reporting iframe height only after the global preloader is replaced with
+      // real content, so the parent page never shrinks the iframe to the preloader size
+      this.setState({ isUserLoading: false }, this.startHeightReporting)
+    );
+
+    Promise.all([userloading, this.props.fetchComments()]).finally(() => {
+      setTimeout(this.checkUrlHash);
+      window.addEventListener('hashchange', this.checkUrlHash);
+    });
+
+    window.addEventListener('message', this.onMessage);
+  }
+
+  componentWillUnmount() {
+    if (this.heightFallbackTimeout !== null) {
+      window.clearTimeout(this.heightFallbackTimeout);
+    }
+    this.heightObserver?.disconnect();
+  }
+
+  checkUrlHash = (e: Event & { newURL: string }) => {
+    const hash = e ? `#${e.newURL.split('#')[1]}` : window.location.hash;
+
+    if (hash.indexOf(`#${COMMENT_NODE_CLASSNAME_PREFIX}`) === 0) {
+      if (e) e.preventDefault();
+
+      if (!document.querySelector(hash)) {
+        const id = getCollapsedParent(hash, this.props.childToParentComments);
+        const indexHash = this.props.topComments.findIndex((item) => item === id);
+        const multiplierCollapsed = Math.ceil(indexHash / MAX_SHOWN_ROOT_COMMENTS);
+        this.setState(
+          {
+            commentsShown: this.state.commentsShown + MAX_SHOWN_ROOT_COMMENTS * multiplierCollapsed,
+          },
+          () => setTimeout(() => this.toMessage(hash), 500)
+        );
+      } else {
+        this.toMessage(hash);
+      }
+    }
+  };
+
+  toMessage = (hash: string) => {
+    const comment = document.querySelector(hash);
+    if (comment) {
+      postMessageToParent({ scrollTo: comment.getBoundingClientRect().top });
+      comment.classList.add('comment_highlighting');
+      setTimeout(() => {
+        comment.classList.remove('comment_highlighting');
+      }, 5e3);
+    }
+  };
+
+  onMessage = (event: MessageEvent) => {
+    if (!isFromParent(event)) {
+      return;
+    }
+
+    const data = parseMessage(event);
+
+    // the theme is applied, store included, by the listener in remark.tsx, which is in place
+    // before this component mounts
+    if (data.signout === true) {
+      this.props.signout(false);
+    }
+  };
+
+  onBlockedUsersShow = async () => {
+    if (this.props.user && this.props.user.admin) {
+      await this.props.fetchBlockedUsers();
+    }
+    this.setState({ isSettingsVisible: true });
+  };
+
+  onBlockedUsersHide = async () => {
+    // if someone was unblocked let's reload comments
+    if (this.state.wasSomeoneUnblocked) {
+      this.props.fetchComments();
+    }
+    this.setState({
+      wasSomeoneUnblocked: false,
+      isSettingsVisible: false,
+    });
+  };
+
+  onUnblockSomeone = () => {
+    this.setState({ wasSomeoneUnblocked: true });
+  };
+
+  showMore = () => {
+    this.setState({
+      commentsShown: this.state.commentsShown + MAX_SHOWN_ROOT_COMMENTS,
+    });
+  };
+
+  render(props: Props, { isUserLoading, commentsShown, isSettingsVisible }: State) {
+    if (isUserLoading) {
+      return <Preloader className={styles.preloader} />;
+    }
+
+    const isCommentsDisabled = props.info.read_only!;
+    const imageUploadHandler = isUserAnonymous(this.props.user) ? undefined : this.props.uploadImage;
+
+    return (
+      <Fragment>
+        <AuthPanel
+          user={this.props.user}
+          hiddenUsers={this.props.hiddenUsers}
+          isCommentsDisabled={isCommentsDisabled}
+          postInfo={this.props.info}
+          signout={this.props.signout}
+          onBlockedUsersShow={this.onBlockedUsersShow}
+          onBlockedUsersHide={this.onBlockedUsersHide}
+          onCommentsChangeReadOnlyMode={this.props.setCommentsReadOnlyState}
+        />
+        <div>
+          {isSettingsVisible ? (
+            <Settings
+              intl={this.props.intl}
+              user={this.props.user}
+              hiddenUsers={this.props.hiddenUsers}
+              blockedUsers={this.props.blockedUsers}
+              blockUser={this.props.blockUser}
+              unblockUser={this.props.unblockUser}
+              hideUser={this.props.hideUser}
+              unhideUser={this.props.unhideUser}
+              onUnblockSomeone={this.onUnblockSomeone}
+            />
+          ) : (
+            <>
+              {!isCommentsDisabled && (
+                <CommentForm
+                  id={encodeURI(url || '')}
+                  intl={this.props.intl}
+                  theme={props.theme}
+                  mix={styles.input}
+                  mode="main"
+                  user={props.user}
+                  onSubmit={(text: string, title: string) => this.props.addComment(text, title)}
+                  getPreview={this.props.getPreview}
+                  uploadImage={imageUploadHandler}
+                />
+              )}
+              {this.props.pinnedComments.length > 0 && (
+                <div
+                  className={styles.pinnedComments}
+                  role="region"
+                  aria-label={this.props.intl.formatMessage(messages.pinnedComments)}
+                >
+                  {this.props.pinnedComments.map((comment) => (
+                    <Comment
+                      CommentForm={CommentForm}
+                      intl={this.props.intl}
+                      key={`pinned-comment-${comment.id}`}
+                      view="pinned"
+                      data={comment}
+                      level={0}
+                      disabled={true}
+                      mix={styles.pinnedComment}
+                    />
+                  ))}
+                </div>
+              )}
+              <div className={styles.sortPicker}>
+                <SortPicker />
+              </div>
+              <Comments
+                commentsShown={commentsShown}
+                isLoading={props.isCommentsLoading}
+                topComments={props.topComments}
+                showMore={this.showMore}
+              />
+            </>
+          )}
+        </div>
+      </Fragment>
+    );
+  }
+}
+
+interface CommentsProps {
+  isLoading: boolean;
+  topComments: string[];
+  commentsShown: number;
+  showMore(): void;
+}
+function Comments({ isLoading, topComments, commentsShown, showMore }: CommentsProps) {
+  const renderComments =
+    IS_MOBILE && commentsShown < topComments.length ? topComments.slice(0, commentsShown) : topComments;
+  const isShowMoreButtonVisible = IS_MOBILE && commentsShown < topComments.length;
+
+  return (
+    <div className={styles.threads} role="list">
+      {isLoading ? (
+        <Preloader className={styles.preloader} />
+      ) : (
+        <>
+          {topComments.length > 0 &&
+            renderComments.map((id) => <Thread key={`thread-${id}`} id={id} level={0} getPreview={getPreview} />)}
+          {isShowMoreButtonVisible && (
+            <Button className={styles.moreComments} onClick={showMore}>
+              <FormattedMessage id="root.show-more" defaultMessage="Show more" />
+            </Button>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+const CopyrightLink = (title: string) => (
+  <a class={styles.copyrightLink} href="https://remark42.com/">
+    {title}
+  </a>
+);
+
+/** Root component connected to redux */
+export function ConnectedRoot() {
+  const intl = useIntl();
+  const props = useSelector(mapStateToProps);
+  const actions = useActions(boundActions);
+
+  return (
+    <div
+      dir={getDirection(intl.locale)}
+      className={clsx(styles.root, props.theme === 'dark' ? styles.themeDark : styles.themeLight, props.theme)}
+    >
+      <Root {...props} {...actions} intl={intl} />
+      {!noFooter && (
+        <p className={styles.copyright} role="contentinfo">
+          <FormattedMessage
+            id="root.powered-by"
+            defaultMessage="Powered by <a>Remark42</a>"
+            values={{ a: CopyrightLink }}
+          />
+        </p>
+      )}
+    </div>
+  );
+}

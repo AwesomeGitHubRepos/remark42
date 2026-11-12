@@ -3,50 +3,50 @@
 // Service object encloses Store and add common methods, this is the one consumer should use.
 package image
 
-//go:generate sh -c "mockery -inpkg -name Store -print > /tmp/mock.tmp && mv /tmp/mock.tmp image_mock.go"
+// NOTE: matryer/moq should be installed globally and works with `go generate ./...`
+//go:generate moq --out image_mock.go . Store
 
 import (
 	"bytes"
 	"context"
 	"crypto/sha1" //nolint:gosec // not used for cryptography
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"image"
-
-	// support gif and jpeg images decoding
-	_ "image/gif"
-	_ "image/jpeg"
+	_ "image/gif"  // register gif decoder
+	_ "image/jpeg" // register jpeg decoder
 	"image/png"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"path"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
 	log "github.com/go-pkgz/lgr"
-	"github.com/hashicorp/go-multierror"
-	"github.com/pkg/errors"
 	"github.com/rs/xid"
 	"golang.org/x/image/draw"
+	_ "golang.org/x/image/webp" // register webp decoder so DecodeConfig accepts what readAndValidateImage allows
 )
 
 // Service wraps Store with common functions needed for any store implementation
-// It also provides async Submit with func param retrieving all submitting ids.
-// Submitted ids committed (i.e. moved from staging to final) on commitTTL expiration.
+// It also provides async Submit with func param retrieving all submitting IDs.
+// Submitted IDs committed (i.e. moved from staging to final) on ServiceParams.EditDuration expiration.
 type Service struct {
 	ServiceParams
 
-	store       Store
-	wg          sync.WaitGroup
-	submitCh    chan submitReq
-	once        sync.Once
-	term        int32 // term value used atomically to detect emergency termination
-	submitCount int32 // atomic increment for counting submitted images
+	store     Store
+	wg        sync.WaitGroup
+	once      sync.Once      // starts the submitter on the first Submit
+	mu        sync.RWMutex   // Submit sends to submitCh under the read lock, Close closes it under the write lock
+	submitCh  chan submitReq // created by the first Submit
+	done      chan struct{}  // closed by Close, so queued submits commit without waiting out EditDuration
+	closed    chan struct{}  // closed once every submitted image is committed after Close
+	closeOnce sync.Once
 }
 
 // ServiceParams contains externally adjustable parameters of Service
@@ -57,21 +57,12 @@ type ServiceParams struct {
 	MaxSize      int
 	MaxHeight    int
 	MaxWidth     int
-
-	// duration of time after which images are checked and committed if still
-	// present in the submitted comment after it's EditDuration is expired
-	commitTTL time.Duration
-	// duration of time after which images are deleted from staging
-	cleanupTTL time.Duration
 }
 
 // StoreInfo contains image store meta information
 type StoreInfo struct {
 	FirstStagingImageTS time.Time
 }
-
-// To regenerate mock run from this directory:
-// sh -c "mockery -inpkg -name Store -print > /tmp/image-mock.tmp && mv /tmp/image-mock.tmp image_mock.go"
 
 // Store defines interface for saving and loading pictures.
 // Declares two-stage save with Commit. Save stores to staging area and Commit moves to the final location.
@@ -81,7 +72,9 @@ type Store interface {
 	Info() (StoreInfo, error)         // get meta information about storage
 	Save(id string, img []byte) error // store image with passed id to staging
 	Load(id string) ([]byte, error)   // load image by ID
+	Delete(id string) error           // delete image by ID
 
+	ResetCleanupTimer(id string) error                    // resets cleanup timer for the image, called on comment preview
 	Commit(id string) error                               // move image from staging to permanent
 	Cleanup(ctx context.Context, ttl time.Duration) error // run removal loop for old images on staging
 }
@@ -95,23 +88,19 @@ type submitReq struct {
 
 // NewService returns new Service instance
 func NewService(s Store, p ServiceParams) *Service {
-	p.commitTTL = p.EditDuration * 15 / 10  // Commit call on every 1.5 * EditDuration
-	p.cleanupTTL = p.EditDuration * 25 / 10 // Cleanup call on every 2.5 * EditDuration
-	// In case Cleanup and Submit start at the same time (case of stale staging images check
-	// on the program start) these TTL values guarantee that Commit will happen before Cleanup.
-	return &Service{ServiceParams: p, store: s}
+	return &Service{ServiceParams: p, store: s, done: make(chan struct{}), closed: make(chan struct{})}
 }
 
-// SubmitAndCommit multiple ids immediately
-func (s *Service) SubmitAndCommit(idsFn func() []string) error {
-	errs := new(multierror.Error)
+// Commit multiple ids immediately
+func (s *Service) Commit(idsFn func() []string) error {
+	var errs []error
 	for _, id := range idsFn() {
 		err := s.store.Commit(id)
 		if err != nil {
-			errs = multierror.Append(errs, errors.Wrapf(err, "failed to commit image %s", id))
+			errs = append(errs, fmt.Errorf("failed to commit image %s: %w", id, err))
 		}
 	}
-	return errs.ErrorOrNil()
+	return errors.Join(errs...)
 }
 
 // Submit multiple ids via function for delayed commit
@@ -120,85 +109,82 @@ func (s *Service) Submit(idsFn func() []string) {
 		return
 	}
 
+	// reset cleanup timer before submitting the images
+	// to prevent them from being cleaned up while waiting for EditDuration to expire
+	for _, imgID := range idsFn() {
+		_ = s.store.ResetCleanupTimer(imgID)
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	select {
+	case <-s.done: // closed, nothing is left to wait out EditDuration, so commit right away
+		if err := s.Commit(idsFn); err != nil {
+			log.Printf("[WARN] image commit error %v", err)
+		}
+		return
+	default:
+	}
+
 	s.once.Do(func() {
 		log.Printf("[DEBUG] image submitter activated")
 		s.submitCh = make(chan submitReq, submitQueueSize)
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		s.wg.Go(func() {
 			for req := range s.submitCh {
-				// wait for commitTTL expiration with emergency pass on term
-				for atomic.LoadInt32(&s.term) == 0 && time.Since(req.TS) <= s.commitTTL {
-					time.Sleep(time.Millisecond * 10) // small sleep to relive busy wait but keep reactive for term (close)
+				// wait for EditDuration expiration, Close cuts the wait short
+				select {
+				case <-time.After(time.Until(req.TS.Add(s.EditDuration))):
+				case <-s.done:
 				}
-				err := s.SubmitAndCommit(req.idsFn)
-				if err != nil {
+				if err := s.Commit(req.idsFn); err != nil {
 					log.Printf("[WARN] image commit error %v", err)
 				}
-
-				atomic.AddInt32(&s.submitCount, -1)
 			}
 			log.Printf("[INFO] image submitter terminated")
-		}()
+		})
 	})
-
-	atomic.AddInt32(&s.submitCount, 1)
-
 	s.submitCh <- submitReq{idsFn: idsFn, TS: time.Now()}
 }
 
 // ExtractPictures gets list of images from the doc html and convert from urls to ids, i.e. user/pic.png
-func (s *Service) ExtractPictures(commentHTML string) (ids []string, err error) {
-
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(commentHTML))
-	if err != nil {
-		return nil, errors.Wrap(err, "can't create document")
-	}
-	doc.Find("img").Each(func(i int, sl *goquery.Selection) {
-		if im, ok := sl.Attr("src"); ok {
-			if strings.Contains(im, s.ImageAPI) {
-				elems := strings.Split(im, "/")
-				if len(elems) >= 2 {
-					id := elems[len(elems)-2] + "/" + elems[len(elems)-1]
-					ids = append(ids, id)
-				}
-			}
-			if strings.Contains(im, s.ProxyAPI) {
-				proxiedURL, err := url.Parse(im)
-				if err != nil {
-					return
-				}
-				imgURL, err := base64.URLEncoding.DecodeString(proxiedURL.Query().Get("src"))
-				if err != nil {
-					return
-				}
-				imgID, err := CachedImgID(string(imgURL))
-				if err != nil {
-					return
-				}
-				ids = append(ids, imgID)
-			}
-		}
-	})
-
-	return ids, nil
+func (s *Service) ExtractPictures(commentHTML string) (ids []string) {
+	return s.extractImageIDs(commentHTML, true)
 }
 
-// Cleanup runs periodic cleanup with cleanupTTL. Blocking loop, should be called inside of goroutine by consumer
+// ExtractNonProxiedPictures gets list of non-proxied images from the doc html and convert from urls to ids, i.e. user/pic.png
+// This method is used in image check on post preview and load, as proxied images have lazy loading
+// and wouldn't be present on disk but still valid as they will be loaded the first time someone requests them.
+func (s *Service) ExtractNonProxiedPictures(commentHTML string) (ids []string) {
+	return s.extractImageIDs(commentHTML, false)
+}
+
+// Cleanup runs periodic cleanup with 1.5*ServiceParams.EditDuration. Blocking loop, should be called inside of goroutine by consumer
 func (s *Service) Cleanup(ctx context.Context) {
-	log.Printf("[INFO] start pictures cleanup, staging ttl=%v", s.cleanupTTL)
+	if s.EditDuration <= 0 {
+		log.Printf("[INFO] pictures cleanup disabled, edit duration is %v", s.EditDuration)
+		<-ctx.Done()
+		return
+	}
+
+	cleanupTTL := s.EditDuration * 15 / 10 // cleanup images older than 1.5 * EditDuration
+	log.Printf("[INFO] start pictures cleanup, staging ttl=%v", cleanupTTL)
 
 	for {
 		select {
 		case <-ctx.Done():
 			log.Printf("[INFO] cleanup terminated, %v", ctx.Err())
 			return
-		case <-time.After(s.cleanupTTL):
-			if err := s.store.Cleanup(ctx, s.cleanupTTL); err != nil {
+		case <-time.After(cleanupTTL):
+			if err := s.store.Cleanup(ctx, cleanupTTL); err != nil {
 				log.Printf("[WARN] failed to cleanup, %v", err)
 			}
 		}
 	}
+}
+
+// ResetCleanupTimer resets cleanup timer for the image
+func (s *Service) ResetCleanupTimer(id string) error {
+	return s.store.ResetCleanupTimer(id)
 }
 
 // Info returns meta information about storage
@@ -206,36 +192,37 @@ func (s *Service) Info() (StoreInfo, error) {
 	return s.store.Info()
 }
 
-// Close flushes all in-progress submits and enforces waiting commits
+// Close commits all submitted images without waiting for EditDuration and returns once they are committed,
+// or when ctx is done, leaving the rest to finish in the background. Submit after Close commits immediately.
 func (s *Service) Close(ctx context.Context) {
 	log.Printf("[INFO] close image service ")
-
-	waitForTerm := func(ctx context.Context) {
-		ticker := time.NewTicker(10 * time.Millisecond)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if atomic.LoadInt32(&s.submitCount) == 0 {
-					return
-				}
+	s.closeOnce.Do(func() {
+		close(s.done) // before taking the lock: a Submit blocked on a full queue holds the read lock until the queue drains
+		go func() {
+			s.mu.Lock()
+			if s.submitCh != nil {
+				close(s.submitCh)
 			}
-		}
+			s.mu.Unlock()
+			s.wg.Wait()
+			close(s.closed)
+		}()
+	})
+	select {
+	case <-s.closed:
+	case <-ctx.Done():
+		log.Printf("[WARN] image service closed before all submitted images were committed, %v", ctx.Err())
 	}
-
-	atomic.StoreInt32(&s.term, 1) // enforce non-delayed commits for all ids left in submitCh
-	waitForTerm(ctx)
-
-	if s.submitCh != nil {
-		close(s.submitCh)
-	}
-	s.wg.Wait()
 }
 
 // Load wraps storage Load function.
 func (s *Service) Load(id string) ([]byte, error) {
 	return s.store.Load(id)
+}
+
+// Delete wraps storage Delete function.
+func (s *Service) Delete(id string) error {
+	return s.store.Delete(id)
 }
 
 // Save wraps storage Save function, validating and resizing the image before calling it.
@@ -253,49 +240,122 @@ func (s *Service) SaveWithID(id string, r io.Reader) error {
 	return s.store.Save(id, img)
 }
 
-// ImgContentType returns content type for provided image
-func (s *Service) ImgContentType(img []byte) string {
-	contentType := http.DetectContentType(img)
-	if contentType == "application/octet-stream" {
-		// replace generic fallback with one which make sense in our scenario
-		return "image/*"
+// SafeIDSegment reports whether seg can be one segment of an image id. It rejects empty and dot
+// segments, any "..", path separators and control characters, so an id built from untrusted
+// input can't resolve outside the image directories.
+func SafeIDSegment(seg string) bool {
+	if seg == "" || seg == "." || strings.Contains(seg, "..") || strings.ContainsAny(seg, `/\`) {
+		return false
 	}
-	return contentType
+	return !strings.ContainsFunc(seg, unicode.IsControl)
 }
+
+// returns list of image IDs from the comment html, including proxied images if includeProxied is true
+func (s *Service) extractImageIDs(commentHTML string, includeProxied bool) (ids []string) {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(commentHTML))
+	if err != nil {
+		log.Printf("[ERROR] can't parse commentHTML to parse images: %q, error: %v", commentHTML, err)
+		return nil
+	}
+	doc.Find("img").Each(func(_ int, sl *goquery.Selection) {
+		if im, ok := sl.Attr("src"); ok {
+			if strings.Contains(im, s.ImageAPI) {
+				elems := strings.Split(im, "/")
+				if len(elems) >= 2 {
+					user, file := elems[len(elems)-2], elems[len(elems)-1]
+					if SafeIDSegment(user) && SafeIDSegment(file) {
+						ids = append(ids, user+"/"+file)
+					}
+				}
+			}
+			if includeProxied && strings.Contains(im, s.ProxyAPI) {
+				proxiedURL, err := url.Parse(im)
+				if err != nil {
+					return
+				}
+				imgURL, err := base64.URLEncoding.DecodeString(proxiedURL.Query().Get("src"))
+				if err != nil {
+					return
+				}
+				imgID, err := CachedImgID(string(imgURL))
+				if err != nil {
+					return
+				}
+				ids = append(ids, imgID)
+			}
+		}
+	})
+
+	return ids
+}
+
+// maxImagePixels caps the declared pixel count of an image before any raster decode
+// is allowed. Without this, a tiny compressed "decompression bomb" image declaring
+// e.g. 65535x65535 px would force image.Decode to allocate gigabytes of pixel memory
+// and OOM the service on a single comment upload. 16 MP covers any realistic image
+// (~4096x4096) while keeping peak allocation bounded.
+const maxImagePixels = 16 * 1024 * 1024
 
 // prepareImage calls readAndValidateImage and resize on provided image.
 func (s *Service) prepareImage(r io.Reader) ([]byte, error) {
 	data, err := readAndValidateImage(r, s.MaxSize)
 	if err != nil {
-		return nil, errors.Wrapf(err, "can't load image")
+		return nil, fmt.Errorf("can't load image: %w", err)
 	}
 
-	data = resize(data, s.MaxWidth, s.MaxHeight)
-	return data, nil
+	resized := resize(data, s.MaxWidth, s.MaxHeight)
+	if resized == nil {
+		return nil, fmt.Errorf("image rejected: malformed or exceeds %d-pixel safe limit", maxImagePixels)
+	}
+	return resized, nil
 }
 
-// resize an image of supported format (PNG, JPG, GIF) to the size of "limit" px of
-// the biggest side (width or height) preserving aspect ratio.
-// Returns original data if resizing is not needed or failed.
-// If resized the result will be for png format
+// resize validates an image and, if needed, re-encodes it to fit within the given
+// pixel limits preserving aspect ratio. Returns nil for malformed input or for
+// declared dimensions exceeding maxImagePixels so attacker payloads (decompression
+// bombs) never reach the store. With limit <= 0 or when the image already fits, the
+// original bytes are returned verbatim so animated GIFs and other multi-frame formats
+// round-trip without being flattened to one frame.
+//
+// Validation uses image.DecodeConfig (cheap — declares dimensions, allocates nothing)
+// before any full image.Decode, so a 100 KB compressed image declaring 65535x65535 px
+// is rejected without ever materializing the raster.
 func resize(data []byte, limitW, limitH int) []byte {
-	if data == nil || limitW <= 0 || limitH <= 0 {
-		return data
+	if len(data) == 0 {
+		return nil
 	}
 
-	src, _, err := image.Decode(bytes.NewBuffer(data))
+	// validate format and dimensions without allocating pixel memory.
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
-		log.Printf("[WARN] can't decode image, %s", err)
+		log.Printf("[WARN] can't decode image config, %s", err)
+		return nil
+	}
+	// multiply in int64 — on 32-bit builds (GOARCH=386, 32-bit arm) the int
+	// product of two 16-bit-or-larger dimensions can overflow and wrap below
+	// maxImagePixels, bypassing the cap.
+	if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > int64(maxImagePixels) {
+		log.Printf("[WARN] image dimensions %dx%d exceed safe limit", cfg.Width, cfg.Height)
+		return nil
+	}
+
+	// dimensions are bounded — full decode is now safe to allocate. Decode also
+	// validates the raster body: a header that DecodeConfig accepts but with a
+	// corrupt or truncated payload would slip through if we returned early on the
+	// no-resize path without ever touching the pixels. Decode unconditionally,
+	// then either return the original bytes (no resize needed, multi-frame intact)
+	// or the re-encoded result.
+	src, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		log.Printf("[WARN] can't decode image after dim-check, %s", err)
+		return nil
+	}
+
+	if limitW <= 0 || limitH <= 0 || (cfg.Width <= limitW && cfg.Height <= limitH) {
 		return data
 	}
 
-	bounds := src.Bounds()
-	w, h := bounds.Dx(), bounds.Dy()
-	if w <= limitW && h <= limitH || w <= 0 || h <= 0 {
-		log.Printf("[DEBUG] resizing image is smaller that the limit or has 0 size")
-		return data
-	}
-
+	w, h := src.Bounds().Dx(), src.Bounds().Dy()
 	newW, newH := getProportionalSizes(w, h, limitW, limitH)
 	m := image.NewRGBA(image.Rect(0, 0, newW, newH))
 	draw.CatmullRom.Scale(m, m.Bounds(), src, src.Bounds(), draw.Src, nil)
@@ -303,14 +363,13 @@ func resize(data []byte, limitW, limitH int) []byte {
 	var out bytes.Buffer
 	if err = png.Encode(&out, m); err != nil {
 		log.Printf("[WARN] can't encode resized image to png, %s", err)
-		return data
+		return data // fall back to the validated original
 	}
 	return out.Bytes()
 }
 
 // getProportionalSizes returns width and height resized by both dimensions proportionally
 func getProportionalSizes(srcW, srcH, limitW, limitH int) (resW, resH int) {
-
 	if srcW <= limitW && srcH <= limitH {
 		return srcW, srcH
 	}
@@ -330,25 +389,30 @@ func getProportionalSizes(srcW, srcH, limitW, limitH int) (resW, resH int) {
 
 // check if file f is a valid image format, i.e. gif, png, jpeg or webp and reads up to maxSize.
 func readAndValidateImage(r io.Reader, maxSize int) ([]byte, error) {
-
 	isValidImage := func(b []byte) bool {
 		ct := http.DetectContentType(b)
 		return ct == "image/gif" || ct == "image/png" || ct == "image/jpeg" || ct == "image/webp"
 	}
 
 	lr := io.LimitReader(r, int64(maxSize)+1)
-	data, err := ioutil.ReadAll(lr)
+	data, err := io.ReadAll(lr)
 	if err != nil {
 		return nil, err
 	}
 
 	if len(data) > maxSize {
-		return nil, errors.Errorf("file is too large (limit=%d)", maxSize)
+		return nil, fmt.Errorf("file is too large (limit=%d)", maxSize)
 	}
 
-	// read header first, needs it to check if data is valid png/gif/jpeg
-	if !isValidImage(data[:512]) {
-		return nil, errors.Errorf("file format not allowed")
+	// read header first to check the format. http.DetectContentType inspects up
+	// to the first 512 bytes, but a smaller body is fine — pass the whole slice
+	// rather than panicking on a fixed-size sub-slice.
+	header := data
+	if len(header) > 512 {
+		header = header[:512]
+	}
+	if !isValidImage(header) {
+		return nil, fmt.Errorf("file format not allowed")
 	}
 
 	return data, nil
@@ -368,11 +432,11 @@ func Sha1Str(s string) string {
 // ID would look like: "cached_images/<sha1-of-image-url-hostname>-<sha1-of-image-entire-url>"
 // <sha1-of-image-url-hostname> - would allow us to identify all images from particular site if ever needed
 // <sha1-of-image-entire-url> - would allow us to avoid storing duplicates of the same image
-//                              (as accurate as deduplication based on potentially mutable url can be)
+// (as accurate as deduplication based on potentially mutable url can be)
 func CachedImgID(imgURL string) (string, error) {
 	parsedURL, err := url.Parse(imgURL)
 	if err != nil {
-		return "", errors.Wrapf(err, "can parse url %s", imgURL)
+		return "", fmt.Errorf("can parse url %s: %w", imgURL, err)
 	}
 	return fmt.Sprintf("cached_images/%s-%s", Sha1Str(parsedURL.Hostname()), Sha1Str(imgURL)), nil
 }

@@ -1,162 +1,120 @@
 package notify
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
-	"net/http"
-	"strconv"
-	"strings"
 	"time"
 
 	log "github.com/go-pkgz/lgr"
-	"github.com/go-pkgz/repeater"
-	"github.com/pkg/errors"
+	ntf "github.com/go-pkgz/notify"
 )
+
+const commentTextLengthLimit = 100
+
+// TelegramParams contain settings for telegram notifications
+type TelegramParams struct {
+	AdminChannelID       string        // unique identifier for the target chat or username of the target channel (in the format @channelusername)
+	Token                string        // token for telegram bot API interactions
+	Timeout              time.Duration // http client timeout
+	UserNotifications    bool          // flag which enables user notifications
+	ErrorMsg, SuccessMsg string        // messages for successful and unsuccessful subscription requests to bot
+	APIURL               string        // bot API base url, for a proxy or a test double; the public API when empty
+}
 
 // Telegram implements notify.Destination for telegram
 type Telegram struct {
-	channelID string // unique identifier for the target chat or username of the target channel (in the format @channelusername)
-	token     string
-	apiPrefix string
-	timeout   time.Duration
-}
+	*ntf.Telegram
 
-const telegramTimeOut = 5000 * time.Millisecond
-const telegramAPIPrefix = "https://api.telegram.org/bot"
+	AdminChannelID    string // unique identifier for the target chat or username of the target channel (in the format @channelusername)
+	UserNotifications bool   // flag which enables user notifications
+}
 
 // NewTelegram makes telegram bot for notifications
-func NewTelegram(token, channelID string, timeout time.Duration, api string) (*Telegram, error) {
-	if _, err := strconv.ParseInt(channelID, 10, 64); err != nil {
-		channelID = "@" + channelID // if channelID not a number enforce @ prefix
-	}
-
-	res := Telegram{channelID: channelID, token: token, apiPrefix: api, timeout: timeout}
-	if res.apiPrefix == "" {
-		res.apiPrefix = telegramAPIPrefix
-	}
-	if res.timeout == 0 {
-		res.timeout = telegramTimeOut
-	}
-	log.Printf("[DEBUG] create new telegram notifier for chan %s, timeout=%s, api=%s", channelID, res.timeout, res.timeout)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	err := repeater.NewDefault(5, time.Millisecond*250).Do(ctx, func() error {
-		client := http.Client{Timeout: telegramTimeOut}
-		resp, err := client.Get(fmt.Sprintf("%s%s/getMe", res.apiPrefix, token))
-		if err != nil {
-			return errors.Wrap(err, "can't initialize telegram notifications")
-		}
-		defer func() {
-			if err = resp.Body.Close(); err != nil {
-				log.Printf("[WARN] can't close request body, %s", err)
-			}
-		}()
-
-		if resp.StatusCode != http.StatusOK {
-			return errors.Errorf("unexpected telegram status code %d", resp.StatusCode)
-		}
-
-		tgResp := struct {
-			OK     bool `json:"ok"`
-			Result struct {
-				FirstName string `json:"first_name"`
-				ID        uint64 `json:"id"`
-				IsBot     bool   `json:"is_bot"`
-				UserName  string `json:"username"`
-			}
-		}{}
-
-		if err = json.NewDecoder(resp.Body).Decode(&tgResp); err != nil {
-			return errors.Wrap(err, "can't decode response")
-		}
-
-		if !tgResp.OK || !tgResp.Result.IsBot {
-			return errors.Errorf("unexpected telegram response %+v", tgResp)
-		}
-		return nil
+func NewTelegram(params TelegramParams) (*Telegram, error) {
+	client, err := ntf.NewTelegram(ntf.TelegramParams{
+		Token:      params.Token,
+		Timeout:    params.Timeout,
+		ErrorMsg:   params.ErrorMsg,
+		SuccessMsg: params.SuccessMsg,
+		APIURL:     params.APIURL,
 	})
+	if err != nil {
+		return nil, err
+	}
 
-	return &res, err
+	return &Telegram{Telegram: client, AdminChannelID: params.AdminChannelID, UserNotifications: params.UserNotifications}, nil
 }
 
-// Send to telegram channel
+// Send to telegram recipients
 func (t *Telegram) Send(ctx context.Context, req Request) error {
-	client := http.Client{Timeout: telegramTimeOut}
-	log.Printf("[DEBUG] send telegram notification to %s, comment id %s", t.channelID, req.Comment.ID)
+	log.Printf("[DEBUG] send telegram notification for comment ID %s", req.Comment.ID)
+	var errs []error
 
-	from := req.Comment.User.Name
-	if req.Comment.ParentID != "" {
-		from += " → " + req.parent.User.Name
-	}
-	from = "*" + from + "*"
-	link := fmt.Sprintf("↦ [original comment](%s)", req.Comment.Locator.URL+uiNav+req.Comment.ID)
-	if req.Comment.PostTitle != "" {
-		link = fmt.Sprintf("↦ [%s](%s)", t.escapeTitle(req.Comment.PostTitle), req.Comment.Locator.URL+uiNav+req.Comment.ID)
-	}
-	u := fmt.Sprintf("%s%s/sendMessage?chat_id=%s&parse_mode=Markdown&disable_web_page_preview=true",
-		t.apiPrefix, t.token, t.channelID)
+	msg := t.buildMessage(req)
 
-	msg := fmt.Sprintf("%s\n\n%s\n\n%s", from, req.Comment.Orig, link)
-	msg = html.UnescapeString(msg)
-	body := struct {
-		Text string `json:"text"`
-	}{Text: msg}
-
-	b, err := json.Marshal(body)
-	if err != nil {
-		return errors.Wrap(err, "failed to make telegram body")
-	}
-
-	r, err := http.NewRequest("POST", u, bytes.NewReader(b))
-	if err != nil {
-		return errors.Wrap(err, "failed to make telegram request")
-	}
-	r.Header.Set("Content-Type", "application/json; charset=utf-8")
-
-	r = r.WithContext(ctx)
-	resp, err := client.Do(r)
-	if err != nil {
-		return errors.Wrap(err, "failed to get telegram response")
-	}
-	defer func() {
-		if err = resp.Body.Close(); err != nil {
-			log.Printf("[WARN] can't close request body, %s", err)
+	if t.AdminChannelID != "" {
+		err := t.Telegram.Send(ctx, fmt.Sprintf("telegram:%s?parseMode=HTML", t.AdminChannelID), msg)
+		if err != nil {
+			errs = append(errs,
+				fmt.Errorf("problem sending admin telegram notification about comment ID %s to %s: %w",
+					req.Comment.ID, t.AdminChannelID, err,
+				),
+			)
 		}
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		return errors.Errorf("unexpected telegram status code %d for url %q", resp.StatusCode, u)
 	}
 
-	tgResp := struct {
-		OK bool `json:"ok"`
-	}{}
-
-	if err = json.NewDecoder(resp.Body).Decode(&tgResp); err != nil {
-		return errors.Wrap(err, "can't decode telegram response")
+	if t.UserNotifications {
+		for _, user := range req.Telegrams {
+			err := t.Telegram.Send(ctx, fmt.Sprintf("telegram:%s?parseMode=HTML", user), msg)
+			if err != nil {
+				errs = append(errs,
+					fmt.Errorf("problem sending user telegram notification about comment ID %s to %q: %w",
+						req.Comment.ID, user, err,
+					),
+				)
+			}
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
-func (t *Telegram) escapeTitle(title string) string {
-	escSymbols := []string{"[", "]", "(", ")"}
-	res := title
-	for _, esc := range escSymbols {
-		res = strings.Replace(res, esc, "\\"+esc, -1)
+// buildMessage generates message for generic notification about new comment
+func (t *Telegram) buildMessage(req Request) string {
+	commentURLPrefix := req.Comment.Locator.URL + uiNav
+
+	msg := fmt.Sprintf(`<a href=%q>%s</a>`, html.EscapeString(commentURLPrefix+req.Comment.ID), ntf.EscapeTelegramText(req.Comment.User.Name))
+
+	if req.Comment.ParentID != "" {
+		msg += fmt.Sprintf(` -> <a href=%q>%s</a>`, html.EscapeString(commentURLPrefix+req.parent.ID), ntf.EscapeTelegramText(req.parent.User.Name))
 	}
-	return res
+
+	msg += fmt.Sprintf("\n\n%s", pruneHTML(ntf.TelegramSupportedHTML(req.Comment.Text), commentTextLengthLimit))
+
+	if req.Comment.ParentID != "" {
+		msg += fmt.Sprintf("\n\n\"<i>%s</i>\"", pruneHTML(ntf.TelegramSupportedHTML(req.parent.Text), commentTextLengthLimit))
+	}
+
+	if req.Comment.PostTitle != "" {
+		msg += fmt.Sprintf("\n\n↦  <a href=%q>%s</a>", html.EscapeString(req.Comment.Locator.URL), ntf.EscapeTelegramText(req.Comment.PostTitle))
+	}
+
+	return msg
 }
 
-// SendVerification is not implemented for telegram
+// SendVerification is not needed for telegram
 func (t *Telegram) SendVerification(_ context.Context, _ VerificationRequest) error {
 	return nil
 }
 
 func (t *Telegram) String() string {
-	return "telegram: " + t.channelID
+	result := t.Telegram.String()
+	if t.AdminChannelID != "" {
+		result += " with admin notifications to " + t.AdminChannelID
+	}
+	if t.UserNotifications {
+		result += " with user notifications enabled"
+	}
+	return result
 }

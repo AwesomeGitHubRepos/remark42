@@ -1,0 +1,316 @@
+// Package provider implements all oauth2, oauth1 as well as custom and direct providers
+package provider
+
+import (
+	"crypto/sha1" //nolint
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/dghubble/oauth1"
+	"github.com/dghubble/oauth1/twitter"
+	"github.com/go-pkgz/auth/v2/logger"
+	"github.com/go-pkgz/auth/v2/token"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/facebook"
+	"golang.org/x/oauth2/github"
+	"golang.org/x/oauth2/google"
+	"golang.org/x/oauth2/microsoft"
+	"golang.org/x/oauth2/yandex"
+)
+
+// UserAttributes is the type that will be used to map user data from provider to token.User
+type UserAttributes map[string]string
+
+// NewGoogle makes google oauth2 provider
+func NewGoogle(p Params) Oauth2Handler {
+	return initOauth2Handler(p, Oauth2Handler{
+		name:     "google",
+		endpoint: google.Endpoint,
+		scopes:   []string{"https://www.googleapis.com/auth/userinfo.profile"},
+		infoURL:  "https://www.googleapis.com/oauth2/v3/userinfo",
+		mapUser: func(data UserData, _ []byte) token.User {
+			userInfo := token.User{
+				// encode email with provider name to avoid collision if same id returned by other provider
+				ID:      "google_" + token.HashID(sha1.New(), data.Value("sub")),
+				Name:    data.Value("name"),
+				Picture: data.Value("picture"),
+			}
+			if userInfo.Name == "" {
+				userInfo.Name = "noname_" + userInfo.ID[8:12]
+			}
+			for k, v := range p.UserAttributes {
+				userInfo.SetStrAttr(v, data.Value(k))
+			}
+			return userInfo
+		},
+	})
+}
+
+// NewGithub makes github oauth2 provider
+func NewGithub(p Params) Oauth2Handler {
+	if p.L == nil {
+		p.L = logger.NoOp // mapUser below captures p, initOauth2Handler defaults its own copy only
+	}
+	return initOauth2Handler(p, Oauth2Handler{
+		name:     "github",
+		endpoint: github.Endpoint,
+		scopes:   []string{},
+		infoURL:  "https://api.github.com/user",
+		mapUser: func(data UserData, bdata []byte) token.User {
+			userInfo := token.User{
+				ID:      "github_" + token.HashID(sha1.New(), data.Value("login")),
+				Name:    data.Value("name"),
+				Picture: data.Value("avatar_url"),
+			}
+			if p.GithubNumericID {
+				// data.Value is not usable here, json numbers decode to float64 and format as "1.345027e+06".
+				// the "gid:" prefix keeps numeric ids out of the login hash space, logins may be all-digit
+				var uinfoJSON struct {
+					ID int64 `json:"id"`
+				}
+				if err := json.Unmarshal(bdata, &uinfoJSON); err == nil && uinfoJSON.ID != 0 {
+					userInfo.ID = "github_" + token.HashID(sha1.New(), "gid:"+strconv.FormatInt(uinfoJSON.ID, 10))
+				} else {
+					// keep the login-based value, matching the default derivation and its recycling caveat
+					p.Logf("[WARN] github numeric id not available, keeping login-based id")
+				}
+			}
+			// github may have no user name, use login in this case
+			if userInfo.Name == "" {
+				userInfo.Name = data.Value("login")
+			}
+			for k, v := range p.UserAttributes {
+				userInfo.SetStrAttr(v, data.Value(k))
+			}
+			return userInfo
+		},
+	})
+}
+
+// NewFacebook makes facebook oauth2 provider
+func NewFacebook(p Params) Oauth2Handler {
+
+	// response format for fb /me call
+	type uinfo struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Picture struct {
+			Data struct {
+				URL string `json:"url"`
+			} `json:"data"`
+		} `json:"picture"`
+	}
+
+	return initOauth2Handler(p, Oauth2Handler{
+		name:     "facebook",
+		endpoint: facebook.Endpoint,
+		scopes:   []string{"public_profile"},
+		infoURL:  "https://graph.facebook.com/me?fields=id,name,picture",
+		mapUser: func(data UserData, bdata []byte) token.User {
+			userInfo := token.User{
+				ID:   "facebook_" + token.HashID(sha1.New(), data.Value("id")),
+				Name: data.Value("name"),
+			}
+			if userInfo.Name == "" {
+				userInfo.Name = userInfo.ID[0:16]
+			}
+
+			uinfoJSON := uinfo{}
+			if err := json.Unmarshal(bdata, &uinfoJSON); err == nil {
+				userInfo.Picture = uinfoJSON.Picture.Data.URL
+			}
+			for k, v := range p.UserAttributes {
+				userInfo.SetStrAttr(v, data.Value(k))
+			}
+			return userInfo
+		},
+	})
+}
+
+// NewYandex makes yandex oauth2 provider
+func NewYandex(p Params) Oauth2Handler {
+	return initOauth2Handler(p, Oauth2Handler{
+		name:     "yandex",
+		endpoint: yandex.Endpoint,
+		scopes:   []string{},
+		// See https://tech.yandex.com/passport/doc/dg/reference/response-docpage/
+		infoURL: "https://login.yandex.ru/info?format=json",
+		mapUser: func(data UserData, _ []byte) token.User {
+			userInfo := token.User{
+				ID:   "yandex_" + token.HashID(sha1.New(), data.Value("id")),
+				Name: data.Value("display_name"), // using Display Name by default
+			}
+			if userInfo.Name == "" {
+				userInfo.Name = data.Value("real_name") // using Real Name (== full name) if Display Name is empty
+			}
+			if userInfo.Name == "" {
+				userInfo.Name = data.Value("login") // otherwise using login
+			}
+
+			if data.Value("default_avatar_id") != "" {
+				userInfo.Picture = fmt.Sprintf("https://avatars.yandex.net/get-yapic/%s/islands-200", data.Value("default_avatar_id"))
+			}
+			for k, v := range p.UserAttributes {
+				userInfo.SetStrAttr(v, data.Value(k))
+			}
+			return userInfo
+		},
+	})
+}
+
+// NewTwitter makes twitter oauth2 provider
+func NewTwitter(p Params) Oauth1Handler {
+	return initOauth1Handler(p, Oauth1Handler{
+		name: "twitter",
+		conf: oauth1.Config{
+			Endpoint: twitter.AuthorizeEndpoint,
+		},
+		infoURL: "https://api.twitter.com/1.1/account/verify_credentials.json",
+		mapUser: func(data UserData, _ []byte) token.User {
+			userInfo := token.User{
+				ID:      "twitter_" + token.HashID(sha1.New(), data.Value("id_str")),
+				Name:    data.Value("screen_name"),
+				Picture: data.Value("profile_image_url_https"),
+			}
+			if userInfo.Name == "" {
+				userInfo.Name = data.Value("name")
+			}
+			for k, v := range p.UserAttributes {
+				userInfo.SetStrAttr(v, data.Value(k))
+			}
+			return userInfo
+		},
+	})
+}
+
+// NewBattlenet makes Battle.net oauth2 provider
+func NewBattlenet(p Params) Oauth2Handler {
+	return initOauth2Handler(p, Oauth2Handler{
+		name: "battlenet",
+		endpoint: oauth2.Endpoint{ //nolint:gosec // G101 false positive, oauth endpoint urls are not credentials
+			AuthURL:   "https://eu.battle.net/oauth/authorize",
+			TokenURL:  "https://eu.battle.net/oauth/token",
+			AuthStyle: oauth2.AuthStyleInParams,
+		},
+		scopes:  []string{},
+		infoURL: "https://eu.battle.net/oauth/userinfo",
+		mapUser: func(data UserData, _ []byte) token.User {
+			userInfo := token.User{
+				ID:   "battlenet_" + token.HashID(sha1.New(), data.Value("id")),
+				Name: data.Value("battletag"),
+			}
+			for k, v := range p.UserAttributes {
+				userInfo.SetStrAttr(v, data.Value(k))
+			}
+			return userInfo
+		},
+	})
+}
+
+// NewMicrosoft makes microsoft azure oauth2 provider
+func NewMicrosoft(p Params) Oauth2Handler {
+	tenant := p.MicrosoftTenant
+	if tenant == "" || strings.ContainsAny(tenant, "/?# \t\n\r") || strings.Contains(tenant, "..") {
+		tenant = "common"
+	}
+	return initOauth2Handler(p, Oauth2Handler{
+		name:     "microsoft",
+		endpoint: microsoft.AzureADEndpoint(tenant),
+		scopes:   []string{"User.Read"},
+		infoURL:  "https://graph.microsoft.com/v1.0/me",
+		// non-beta doesn't provide photo for consumers yet
+		// see https://github.com/microsoftgraph/microsoft-graph-docs/issues/3990
+		mapUser: func(data UserData, _ []byte) token.User {
+			userInfo := token.User{
+				ID:      "microsoft_" + token.HashID(sha1.New(), data.Value("id")),
+				Name:    data.Value("displayName"),
+				Picture: "https://graph.microsoft.com/beta/me/photo/$value",
+			}
+			for k, v := range p.UserAttributes {
+				userInfo.SetStrAttr(v, data.Value(k))
+			}
+			return userInfo
+		},
+	})
+}
+
+// NewPatreon makes patreon oauth2 provider
+func NewPatreon(p Params) Oauth2Handler {
+	type uinfo struct {
+		Data struct {
+			Attributes struct {
+				FullName string `json:"full_name"`
+				ImageURL string `json:"image_url"`
+			} `json:"attributes"`
+			ID            string `json:"id"`
+			Relationships struct {
+				Pledges struct {
+					Data []struct {
+						ID   string `json:"id"`
+						Type string `json:"type"`
+					} `json:"data"`
+				} `json:"pledges"`
+			} `json:"relationships"`
+		} `json:"data"`
+	}
+
+	return initOauth2Handler(p, Oauth2Handler{
+		name: "patreon",
+		// see https://docs.patreon.com/?shell#oauth
+		endpoint: oauth2.Endpoint{ //nolint:gosec // G101 false positive, oauth endpoint urls are not credentials
+			AuthURL:   "https://www.patreon.com/oauth2/authorize",
+			TokenURL:  "https://api.patreon.com/oauth2/token",
+			AuthStyle: oauth2.AuthStyleInParams,
+		},
+		scopes:  []string{},
+		infoURL: "https://www.patreon.com/api/oauth2/api/current_user",
+
+		mapUser: func(data UserData, bdata []byte) token.User {
+			userInfo := token.User{}
+
+			uinfoJSON := uinfo{}
+			if err := json.Unmarshal(bdata, &uinfoJSON); err == nil {
+				userInfo.ID = "patreon_" + token.HashID(sha1.New(), uinfoJSON.Data.ID)
+				userInfo.Name = uinfoJSON.Data.Attributes.FullName
+				userInfo.Picture = uinfoJSON.Data.Attributes.ImageURL
+
+				// check if the user is your subscriber
+				if len(uinfoJSON.Data.Relationships.Pledges.Data) > 0 {
+					userInfo.SetPaidSub(true)
+				}
+			}
+			for k, v := range p.UserAttributes {
+				userInfo.SetStrAttr(v, data.Value(k))
+			}
+			return userInfo
+		},
+	})
+}
+
+// NewDiscord makes discord oauth2 provider
+func NewDiscord(p Params) Oauth2Handler {
+	return initOauth2Handler(p, Oauth2Handler{
+		name: "discord",
+		// see https://discord.com/developers/docs/topics/oauth2
+		endpoint: oauth2.Endpoint{ //nolint:gosec // G101 false positive, oauth endpoint urls are not credentials
+			AuthURL:  "https://discord.com/oauth2/authorize",
+			TokenURL: "https://discord.com/api/oauth2/token",
+		},
+		infoURL: "https://discord.com/api/v10/users/@me",
+		scopes:  []string{"identify"},
+		mapUser: func(data UserData, _ []byte) token.User {
+			userInfo := token.User{
+				ID:      "discord_" + token.HashID(sha1.New(), data.Value("id")),
+				Name:    data.Value("username"),
+				Picture: fmt.Sprintf("https://cdn.discordapp.com/avatars/%s/%s.webp", data.Value("id"), data.Value("avatar")),
+			}
+
+			for k, v := range p.UserAttributes {
+				userInfo.SetStrAttr(v, data.Value(k))
+			}
+			return userInfo
+		},
+	})
+}

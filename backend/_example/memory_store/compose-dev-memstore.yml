@@ -1,10 +1,9 @@
 # compose file demonstrating custom storage use. The memory_store (see backend/_example/memory_store) starts
 # in a separate container and remark42 communicates to mem_store.r42 via STORE_RPC_API url
 
-version: '2'
+version: "2"
 
 services:
-
   remark42:
     build:
       context: ../../..
@@ -12,7 +11,7 @@ services:
       args:
         - SKIP_BACKEND_TEST=true
         - SKIP_FRONTEND_TEST=true
-    image: umputun/remark42:dev
+    image: ghcr.io/umputun/remark42:dev
     container_name: "remark42-dev"
     hostname: "remark42-dev"
     restart: always
@@ -30,7 +29,6 @@ services:
     environment:
       - REMARK_URL=http://127.0.0.1:8080
       - SECRET=123456
-      - BACKUP_PATH=/srv/var/backup
       - DEBUG=true
       - EMOJI=true
       - AUTH_ANON=true

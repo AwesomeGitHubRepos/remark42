@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	log "github.com/go-pkgz/lgr"
 
@@ -19,9 +20,12 @@ type Service struct {
 	queue             chan Request
 	verificationQueue chan VerificationRequest
 
-	closed uint32 // non-zero means closed. uses uint instead of bool for atomic
-	ctx    context.Context
-	cancel context.CancelFunc
+	closed       atomic.Uint32 // non-zero means closed. uses uint instead of bool for atomic
+	queueMu      sync.RWMutex  // held for reading while sending to the queues, for writing while closing them
+	done         chan struct{} // closed when the delivery goroutine exits
+	closeTimeout time.Duration // how long Close waits for queued notifications before aborting them
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 // Destination defines interface for a given destination service, like telegram, email and so on
@@ -34,14 +38,19 @@ type Destination interface {
 // Store defines the minimal interface accessing stored comments used by notifier
 type Store interface {
 	Get(locator store.Locator, id string, user store.User) (store.Comment, error)
-	GetUserEmail(siteID string, userID string) (string, error)
+	GetUserEmail(siteID, userID string) (string, error)
+	GetUserTelegram(siteID, userID string) (string, error)
 }
+
+// used for email and telegram retrieval from user details
+type getUserDetail func(string, string) (string, error)
 
 // Request notification for a Comment
 type Request struct {
-	Comment     store.Comment
-	parent      store.Comment
-	Emails      []string
+	Comment   store.Comment
+	parent    store.Comment
+	Emails    []string
+	Telegrams []string
 }
 
 // VerificationRequest notification for user
@@ -53,6 +62,12 @@ type VerificationRequest struct {
 }
 
 const defaultQueueSize = 100
+
+// defaultCloseTimeout bounds how long Close waits for queued notifications to be delivered
+const defaultCloseTimeout = 10 * time.Second
+
+// closeGrace bounds how long Close waits for destinations to stop after aborting them
+const closeGrace = time.Second
 const uiNav = "#remark42__comment-"
 
 // NewService makes notification service routing comments to all destinations.
@@ -66,11 +81,15 @@ func NewService(dataService Store, size int, destinations ...Destination) *Servi
 		queue:             make(chan Request, size),
 		verificationQueue: make(chan VerificationRequest, size),
 		destinations:      destinations,
+		done:              make(chan struct{}),
+		closeTimeout:      defaultCloseTimeout,
 		ctx:               ctx,
 		cancel:            cancel,
 	}
 	if len(destinations) > 0 {
 		go res.do()
+	} else {
+		close(res.done)
 	}
 	log.Printf("[INFO] create notifier service, queue size=%d, destinations=%d", size, len(destinations))
 	return &res
@@ -78,14 +97,20 @@ func NewService(dataService Store, size int, destinations ...Destination) *Servi
 
 // Submit Request to internal channel if not busy, drop if can't send
 func (s *Service) Submit(req Request) {
-	if len(s.destinations) == 0 || atomic.LoadUint32(&s.closed) != 0 {
+	if len(s.destinations) == 0 || s.closed.Load() != 0 {
 		return
 	}
 	if s.dataService != nil && req.Comment.ParentID != "" {
 		if p, err := s.dataService.Get(req.Comment.Locator, req.Comment.ParentID, store.User{}); err == nil {
 			req.parent = p
-			req.Emails = deduplicateStrings(s.getNotificationEmails(req, p))
+			req.Emails = s.getNotificationTargets(req, p, s.dataService.GetUserEmail)
+			req.Telegrams = s.getNotificationTargets(req, p, s.dataService.GetUserTelegram)
 		}
+	}
+	s.queueMu.RLock()
+	defer s.queueMu.RUnlock()
+	if s.closed.Load() != 0 {
+		return
 	}
 	select {
 	case s.queue <- req:
@@ -94,30 +119,42 @@ func (s *Service) Submit(req Request) {
 	}
 }
 
-// getNotificationEmails returns list of emails for notifications for provided comment.
-// Emails is not added to the returned list in case original message is from the same user as the notification receiver.
-func (s *Service) getNotificationEmails(req Request, notifyComment store.Comment) (result []string) {
+// getNotificationTargets returns list of notification targets (like email or telegram username) for users
+// interested in notifications for provided comment.
+// Targets are not added to the returned list in case the original message
+// is from the same user as the notification receiver.
+// Results are deduplicated.
+func (s *Service) getNotificationTargets(
+	req Request,
+	notifyComment store.Comment,
+	getUserDetail getUserDetail,
+) (result []string) {
 	// add current user email only if the user is not the one who wrote the original comment
 	if notifyComment.User.ID != req.Comment.User.ID {
-		email, err := s.dataService.GetUserEmail(req.Comment.Locator.SiteID, notifyComment.User.ID)
+		detail, err := getUserDetail(req.Comment.Locator.SiteID, notifyComment.User.ID)
 		if err != nil {
-			log.Printf("[WARN] can't read email for %s, %v", notifyComment.User.ID, err)
+			log.Printf("[WARN] can't read notification detail for %s, %v", notifyComment.User.ID, err)
 		}
-		if email != "" {
-			result = append(result, email)
+		if detail != "" {
+			result = append(result, detail)
 		}
 	}
 	if notifyComment.ParentID != "" {
 		if p, err := s.dataService.Get(req.Comment.Locator, notifyComment.ParentID, store.User{}); err == nil {
-			result = append(result, s.getNotificationEmails(req, p)...)
+			result = append(result, s.getNotificationTargets(req, p, getUserDetail)...)
 		}
 	}
-	return result
+	return deduplicateStrings(result)
 }
 
 // SubmitVerification to internal channel if not busy, drop if can't send
 func (s *Service) SubmitVerification(req VerificationRequest) {
-	if len(s.destinations) == 0 || atomic.LoadUint32(&s.closed) != 0 {
+	if len(s.destinations) == 0 || s.closed.Load() != 0 {
+		return
+	}
+	s.queueMu.RLock()
+	defer s.queueMu.RUnlock()
+	if s.closed.Load() != 0 {
 		return
 	}
 	select {
@@ -127,55 +164,74 @@ func (s *Service) SubmitVerification(req VerificationRequest) {
 	}
 }
 
-// Close queue channel and wait for completion
+// Close stops accepting notifications and waits for the queued ones to be delivered, up to closeTimeout.
+// Notifications still undelivered after that are aborted, and Close waits at most closeGrace more for the
+// destinations to stop, since some of them may ignore the context. Repeated calls do nothing.
 func (s *Service) Close() {
-	if s.queue != nil {
-		log.Print("[DEBUG] close notifier")
-		close(s.queue)
-		close(s.verificationQueue)
-		s.cancel()
-		<-s.ctx.Done()
+	s.queueMu.Lock()
+	if s.closed.Load() != 0 {
+		s.queueMu.Unlock()
+		return
 	}
-	atomic.StoreUint32(&s.closed, 1)
+	s.closed.Store(1)
+	if s.queue == nil { // zero-value service, such as NopService
+		s.queueMu.Unlock()
+		return
+	}
+	log.Print("[DEBUG] close notifier")
+	close(s.queue)
+	close(s.verificationQueue)
+	s.queueMu.Unlock()
+
+	select {
+	case <-s.done:
+	case <-time.After(s.closeTimeout):
+		log.Printf("[WARN] notifications not delivered in %v, aborting the rest", s.closeTimeout)
+	}
+	s.cancel()
+	select {
+	case <-s.done:
+	case <-time.After(closeGrace):
+		log.Printf("[WARN] notification destinations did not stop in %v after abort, not waiting for them", closeGrace)
+	}
 }
 
+// do delivers queued notifications until both queues are closed and drained, or the context is canceled
 func (s *Service) do() {
-	defer log.Print("[WARN] terminated notifier")
-	var wg sync.WaitGroup
-	for {
+	defer close(s.done)
+	defer log.Print("[DEBUG] terminated notifier")
+	queue, verificationQueue := s.queue, s.verificationQueue
+	for queue != nil || verificationQueue != nil {
 		select {
-		case c, ok := <-s.queue:
+		case c, ok := <-queue:
 			if !ok {
-				return
+				queue = nil
+				continue
 			}
-			wg.Add(len(s.destinations))
-			for _, dest := range s.destinations {
-				go func(d Destination) {
-					if err := d.Send(s.ctx, c); err != nil {
-						log.Printf("[WARN] failed to send to %s, %s", d, err)
-					}
-					wg.Done()
-				}(dest)
-			}
-			wg.Wait()
-		case v, ok := <-s.verificationQueue:
+			s.deliver(func(d Destination) error { return d.Send(s.ctx, c) })
+		case v, ok := <-verificationQueue:
 			if !ok {
-				return
+				verificationQueue = nil
+				continue
 			}
-			wg.Add(len(s.destinations))
-			for _, dest := range s.destinations {
-				go func(d Destination) {
-					if err := d.SendVerification(s.ctx, v); err != nil {
-						log.Printf("[WARN] failed to send to %s, %s", d, err)
-					}
-					wg.Done()
-				}(dest)
-			}
-			wg.Wait()
+			s.deliver(func(d Destination) error { return d.SendVerification(s.ctx, v) })
 		case <-s.ctx.Done():
 			return
 		}
 	}
+}
+
+// deliver calls send for every destination in parallel and waits for all of them
+func (s *Service) deliver(send func(Destination) error) {
+	var wg sync.WaitGroup
+	for _, dest := range s.destinations {
+		wg.Go(func() {
+			if err := send(dest); err != nil {
+				log.Printf("[WARN] failed to send to %s, %s", dest, err)
+			}
+		})
+	}
+	wg.Wait()
 }
 
 // NopService is do-nothing notifier, without destinations

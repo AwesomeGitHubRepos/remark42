@@ -2,7 +2,7 @@ package engine
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -74,7 +74,7 @@ func TestRemote_GetWithErrorRemote(t *testing.T) {
 
 func TestRemote_FailedStatus(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		require.NoError(t, err)
 		t.Logf("req: %s", string(body))
 		w.WriteHeader(400)
@@ -95,7 +95,6 @@ func TestRemote_Update(t *testing.T) {
 	err := c.Update(store.Comment{ID: "123", Locator: store.Locator{URL: "http://example.com/url", SiteID: "site123"},
 		Text: "msg"})
 	assert.NoError(t, err)
-
 }
 
 func TestRemote_Find(t *testing.T) {
@@ -135,7 +134,13 @@ func TestRemote_ListFlag(t *testing.T) {
 	c := RPC{Client: jrpc.Client{API: ts.URL, Client: http.Client{}}}
 	res, err := c.ListFlags(FlagRequest{Locator: store.Locator{SiteID: "site_id"}, Flag: Blocked})
 	assert.NoError(t, err)
-	assert.Equal(t, []interface{}{map[string]interface{}{"ID": "id1"}, map[string]interface{}{"ID": "id2"}}, res)
+	require.Equal(t, 2, len(res))
+	blockedUsers := make([]store.BlockedUser, 0, len(res))
+	for _, v := range res {
+		blockedUsers = append(blockedUsers, v.(store.BlockedUser))
+	}
+	assert.Equal(t, 2, len(blockedUsers))
+	assert.Equal(t, []store.BlockedUser{{ID: "id1"}, {ID: "id2"}}, blockedUsers)
 }
 
 func TestRemote_UserDetail(t *testing.T) {
@@ -181,16 +186,22 @@ func TestRemote_Delete(t *testing.T) {
 }
 
 func TestRemote_Close(t *testing.T) {
-	ts := testServer(t, `{"method":"store.close","id":1}`, `{}`)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		assert.Contains(t, string(body), "{\"method\":\"store.close\",\"id\":")
+		t.Logf("req: %s", string(body))
+		_, _ = fmt.Fprint(w, "{}")
+	}))
 	defer ts.Close()
 	c := RPC{Client: jrpc.Client{API: ts.URL, Client: http.Client{}}}
-	err := c.Close()
-	assert.NoError(t, err)
+	assert.NoError(t, c.Close())
+	assert.NoError(t, c.Close(), "second call should not result in panic or errors")
 }
 
 func testServer(t *testing.T, req, resp string) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		require.NoError(t, err)
 		assert.Equal(t, req, string(body))
 		t.Logf("req: %s", string(body))

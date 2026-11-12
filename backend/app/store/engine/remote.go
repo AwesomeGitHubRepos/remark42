@@ -15,7 +15,6 @@ type RPC struct {
 
 // Create comment and return ID
 func (r *RPC) Create(comment store.Comment) (commentID string, err error) {
-
 	resp, err := r.Call("store.create", comment)
 	if err != nil {
 		return "", err
@@ -72,14 +71,44 @@ func (r *RPC) Flag(req FlagRequest) (status bool, err error) {
 	return status, err
 }
 
+func unmarshalString(data []byte) ([]any, error) {
+	var strings []string
+	if err := json.Unmarshal(data, &strings); err != nil {
+		return nil, err
+	}
+	list := make([]any, 0, len(strings))
+	for _, w := range strings {
+		list = append(list, w)
+	}
+	return list, nil
+}
+
+func unmarshalBlockedUser(data []byte) ([]any, error) {
+	var blockedUsers []store.BlockedUser
+	if err := json.Unmarshal(data, &blockedUsers); err != nil {
+		return nil, err
+	}
+	list := make([]any, 0, len(blockedUsers))
+	for _, w := range blockedUsers {
+		list = append(list, w)
+	}
+	return list, nil
+}
+
 // ListFlags get list of flagged keys, like blocked & verified user
-func (r *RPC) ListFlags(req FlagRequest) (list []interface{}, err error) {
+func (r *RPC) ListFlags(req FlagRequest) ([]any, error) {
 	resp, err := r.Call("store.list_flags", req)
 	if err != nil {
 		return nil, err
 	}
-	err = json.Unmarshal(*resp.Result, &list)
-	return list, err
+	// try []store.BlockedUser
+	list, err := unmarshalBlockedUser(*resp.Result)
+	if err == nil {
+		return list, nil
+	}
+
+	// try []strings
+	return unmarshalString(*resp.Result)
 }
 
 // UserDetail sets or gets single detail value, or gets all details for requested site.
@@ -113,5 +142,6 @@ func (r *RPC) Delete(req DeleteRequest) error {
 // Close storage engine
 func (r *RPC) Close() error {
 	_, err := r.Call("store.close")
+	r.Client.Client.CloseIdleConnections()
 	return err
 }

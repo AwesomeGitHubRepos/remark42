@@ -1,82 +1,126 @@
-FROM umputun/baseimage:buildgo-v1.6.1 as build-backend
+FROM --platform=$BUILDPLATFORM node:24-alpine AS frontend-deps
+
+ARG SKIP_FRONTEND_TEST
+ARG SKIP_FRONTEND_BUILD
+# the manifest's prepare script installs husky hooks, which needs a git repository the build
+# context does not have. husky itself skips on CI, and this is the same flag the build stage sets
+ENV CI=true
+
+WORKDIR /srv/frontend/apps/remark42/
+
+COPY ./frontend/apps/remark42/package.json ./frontend/apps/remark42/pnpm-lock.yaml /srv/frontend/apps/remark42/
+
+RUN \
+  if [[ -z "$SKIP_FRONTEND_BUILD" || -z "$SKIP_FRONTEND_TEST" ]]; then \
+    apk add --no-cache --update git && \
+    npm i -g pnpm@10.10.0; \
+  fi
+
+RUN --mount=type=cache,id=pnpm,target=/root/.pnpm-store/v3 \
+  if [[ -z "$SKIP_FRONTEND_BUILD" || -z "$SKIP_FRONTEND_TEST" ]]; then \
+    pnpm i; \
+  fi
+
+
+FROM --platform=$BUILDPLATFORM frontend-deps AS build-frontend
+
+ARG SKIP_FRONTEND_TEST
+ARG SKIP_FRONTEND_BUILD
+# the same argument the backend stage reads, so one flag instruments both halves of the stack
+ARG COVERAGE
+ENV CI=true
+
+WORKDIR /srv/frontend/apps/remark42/
+
+COPY ./frontend/apps/remark42/ /srv/frontend/apps/remark42/
+
+RUN \
+  if [ -z "$SKIP_FRONTEND_TEST" ]; then \
+    pnpm lint type-check translation-check test; \
+  else \
+    echo 'Skip frontend test'; \
+  fi
+
+RUN \
+  if [ -z "$SKIP_FRONTEND_BUILD" ]; then \
+    E2E_COVERAGE=$COVERAGE pnpm build; \
+  else \
+    mkdir /srv/frontend/apps/remark42/public; \
+    echo 'Skip frontend build'; \
+  fi
+
+FROM umputun/baseimage:buildgo-v1.21.1 AS build-backend
 
 ARG CI
-ARG DRONE
-ARG DRONE_TAG
-ARG DRONE_COMMIT
-ARG DRONE_BRANCH
-ARG DRONE_PULL_REQUEST
-
+ARG GITHUB_REF
+ARG GITHUB_SHA
+ARG GIT_BRANCH
 ARG SKIP_BACKEND_TEST
 ARG BACKEND_TEST_TIMEOUT
 
-ADD backend /build/backend
-ADD .git/ /build/backend/.git/
-WORKDIR /build/backend
-
-ENV GOFLAGS="-mod=vendor"
-
 # install gcc in order to be able to go test package with -race
 RUN apk --no-cache add gcc libc-dev
+
+ADD backend /build/backend
+# to embed the frontend files statically into Remark42 binary
+COPY --from=build-frontend /srv/frontend/apps/remark42/public/ /build/backend/app/cmd/web/
+WORKDIR /build/backend
+
+RUN echo go version: `go version`
 
 # run tests
 RUN \
     cd app && \
     if [ -z "$SKIP_BACKEND_TEST" ] ; then \
         CGO_ENABLED=1 go test -race -p 1 -timeout="${BACKEND_TEST_TIMEOUT:-300s}" -covermode=atomic -coverprofile=/profile.cov_tmp ./... && \
-        cat /profile.cov_tmp | grep -v "_mock.go" > /profile.cov ; \
+        cat /profile.cov_tmp | grep -v "_mock.go" > /profile.cov && \
         golangci-lint run --config ../.golangci.yml ./... ; \
-    else echo "skip backend tests and linter" ; fi
+    else \
+      echo "skip backend tests and linter" \
+    ; fi
 
-# if DRONE presented use DRONE_* git env to make version
+# COVERAGE builds an instrumented binary that writes a profile to GOCOVERDIR as it exits, which
+# is what lets the e2e suite report what it reached. It is an argument and not an environment
+# variable because the instrumented binary is a different build, and it must not be what a
+# published image ships.
+ARG COVERAGE
+
 RUN \
-    if [ -z "$DRONE" ] ; then echo "runs outside of drone" && version="$(/script/git-rev.sh)" ; \
-    else version=${DRONE_TAG}${DRONE_BRANCH}${DRONE_PULL_REQUEST}-${DRONE_COMMIT:0:7}-$(date +%Y%m%d-%H:%M:%S) ; fi && \
+    version="$(/script/version.sh)" && \
     echo "version=$version" && \
-    go build -o remark42 -ldflags "-X main.revision=${version} -s -w" ./app
+    if [ "$COVERAGE" = "1" ] ; then \
+        go build -cover -covermode=atomic -coverpkg=./... -o remark42 -ldflags "-X main.revision=${version}" ./app ; \
+    else \
+        go build -o remark42 -ldflags "-X main.revision=${version} -s -w" ./app ; \
+    fi
 
-FROM node:12.16-alpine as build-frontend-deps
+FROM umputun/baseimage:app-v1.21.1
 
-ARG CI
-ENV HUSKY_SKIP_INSTALL=true
+ARG GITHUB_SHA
 
-RUN apk add --no-cache --update git
-ADD frontend/package.json /srv/frontend/package.json
-ADD frontend/package-lock.json /srv/frontend/package-lock.json
-RUN cd /srv/frontend && CI=true npm ci --loglevel warn
-
-FROM node:12.16-alpine as build-frontend
-
-ARG CI
-ARG SKIP_FRONTEND_TEST
-ARG NODE_ENV=production
-
-COPY --from=build-frontend-deps /srv/frontend/node_modules /srv/frontend/node_modules
-ADD frontend /srv/frontend
-RUN cd /srv/frontend && \
-    if [ -z "$SKIP_FRONTEND_TEST" ] ; then npx run-p lint test check; \
-    else echo "skip frontend tests and lint" ; npm run build ; fi && \
-    rm -rf ./node_modules
-
-FROM umputun/baseimage:app-v1.6.1
+LABEL org.opencontainers.image.authors="Umputun <umputun@gmail.com>" \
+      org.opencontainers.image.description="Remark42 comment engine" \
+      org.opencontainers.image.documentation="https://remark42.com/docs/getting-started/" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="https://github.com/umputun/remark42" \
+      org.opencontainers.image.title="Remark42" \
+      org.opencontainers.image.url="https://remark42.com/" \
+      org.opencontainers.image.revision="${GITHUB_SHA}"
 
 WORKDIR /srv
 
-ADD docker-init.sh /entrypoint.sh
+COPY docker-init.sh /srv/init.sh
 ADD backend/scripts/backup.sh /usr/local/bin/backup
 ADD backend/scripts/restore.sh /usr/local/bin/restore
 ADD backend/scripts/import.sh /usr/local/bin/import
-RUN chmod +x /entrypoint.sh /usr/local/bin/backup /usr/local/bin/restore /usr/local/bin/import
+RUN chmod +x /srv/init.sh /usr/local/bin/backup /usr/local/bin/restore /usr/local/bin/import
 
 COPY --from=build-backend /build/backend/remark42 /srv/remark42
-COPY --from=build-backend /build/backend/templates /srv
-COPY --from=build-frontend /srv/frontend/public/ /srv/web
+COPY --from=build-frontend /srv/frontend/apps/remark42/public/ /srv/web/
 RUN chown -R app:app /srv
 RUN ln -s /srv/remark42 /usr/bin/remark42
 
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s CMD curl --fail http://localhost:8080/ping || exit 1
 
-COPY docker-init.sh /srv/init.sh
-RUN chmod +x /srv/init.sh
 CMD ["/srv/remark42", "server"]

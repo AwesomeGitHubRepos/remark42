@@ -1,31 +1,63 @@
 name: build
 
 on:
-  push:
-    branches:
-    tags:
-    paths:
-      - '.github/workflows/ci-build.yml'
-      - 'backend/**'
-      - 'frontend/**'
-      - '.dockerignore'
-      - 'docker-init.sh'
-      - 'Dockerfile'
   pull_request:
     paths:
-      - '.github/workflows/ci-build.yml'
-      - 'backend/**'
-      - 'frontend/**'
-      - '.dockerignore'
-      - 'docker-init.sh'
-      - 'Dockerfile'
+      - ".github/workflows/ci-build.yml"
+      - "backend/**"
+      - "frontend/apps/**"
+      - ".dockerignore"
+      - "docker-init.sh"
+      - "Dockerfile"
+      - "!**.md"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
+  build-images:
+    name: Validate Docker build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      - name: build docker image
-        run: docker build --build-arg SKIP_BACKEND_TEST=true --build-arg SKIP_FRONTEND_TEST=true --build-arg CI=github .
+      - name: set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          docker system prune -af
+
+      - name: build docker image without pushing
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          cache-from: type=gha,scope=main
+          cache-to: type=gha,scope=main,mode=max,ignore-error=true
+          build-args: |
+            SKIP_BACKEND_TEST=true
+            SKIP_FRONTEND_TEST=true
+
+      - name: build example docker image without pushing
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: backend/_example/memory_store/Dockerfile
+          platforms: linux/amd64
+          load: true
+          cache-from: type=gha,scope=example
+          cache-to: type=gha,scope=example,mode=max,ignore-error=true
+          build-args: |
+            SKIP_BACKEND_TEST=true
+            SKIP_FRONTEND_TEST=true

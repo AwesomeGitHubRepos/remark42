@@ -24,7 +24,7 @@ func TestWordPress_Import(t *testing.T) {
 
 	dataStore := service.DataStore{Engine: b, AdminStore: admin.NewStaticStore("12345", nil, []string{}, "")}
 	defer dataStore.Close()
-	wp := WordPress{DataStore: &dataStore}
+	wp := WordPress{DataStore: &dataStore, DisableFancyTextFormatting: false}
 	size, err := wp.Import(strings.NewReader(xmlTestWP), siteID)
 	assert.NoError(t, err)
 	assert.Equal(t, 3, size)
@@ -41,7 +41,7 @@ func TestWordPress_Import(t *testing.T) {
 	assert.Equal(t, "e8b1e92bbcf5b9bb88472f9bdb82d1b8c7ed39d6", c.User.IP)
 	ts, _ := time.Parse(wpTimeLayout, "2010-08-18 15:19:14")
 	assert.Equal(t, ts, c.Timestamp)
-	assert.Equal(t, c.Text, "<p>Mekkatorque was over in that tent up to the right</p>\n")
+	assert.Equal(t, "<p>«Mekkatorque» was over in that tent up to the right</p>\n", c.Text)
 	assert.True(t, c.Imported)
 
 	posts, err := dataStore.List(siteID, 0, 0)
@@ -54,16 +54,28 @@ func TestWordPress_Import(t *testing.T) {
 	count, err := dataStore.Count(store.Locator{URL: "https://realmenweardress.es/2010/07/do-you-rp/", SiteID: siteID})
 	assert.NoError(t, err)
 	assert.Equal(t, 3, count)
+
+	// test with DisableFancyTextFormatting
+	wp = WordPress{DataStore: &dataStore, DisableFancyTextFormatting: true}
+	size, err = wp.Import(strings.NewReader(xmlTestWP), siteID)
+	assert.NoError(t, err)
+	assert.Equal(t, 3, size)
+
+	last, err = dataStore.Last(siteID, 10, time.Time{}, adminUser)
+	assert.NoError(t, err)
+	require.Equal(t, 3, len(last), "3 comments imported")
+
+	assert.Equal(t, "<p>&#34;Mekkatorque&#34; was over in that tent up to the right</p>\n", last[0].Text)
 }
 
 func TestWordPress_Convert(t *testing.T) {
 	wp := WordPress{}
-	ch := wp.convert(strings.NewReader(xmlTestWP), "testWP")
-
-	comments := []store.Comment{}
-	for c := range ch {
+	comments := make([]store.Comment, 0, 3)
+	err := wp.convert(strings.NewReader(xmlTestWP), "testWP", func(c store.Comment) error {
 		comments = append(comments, c)
-	}
+		return nil
+	})
+	require.NoError(t, err)
 	require.Equal(t, 3, len(comments), "3 comments exported, 1 excluded")
 
 	exp1 := store.Comment{
@@ -86,12 +98,12 @@ func TestWordPress_Convert(t *testing.T) {
 
 func TestWP_Convert_MD(t *testing.T) {
 	wp := WordPress{}
-	ch := wp.convert(strings.NewReader(xmlTestWPmd), "siteID")
-
-	comments := []store.Comment{}
-	for c := range ch {
+	comments := make([]store.Comment, 0, 3)
+	err := wp.convert(strings.NewReader(xmlTestWPmd), "siteID", func(c store.Comment) error {
 		comments = append(comments, c)
-	}
+		return nil
+	})
+	require.NoError(t, err)
 	require.Equal(t, 3, len(comments), "3 comments exported")
 
 	assert.Equal(t, "<p>Row1<br/>\nRow2</p>\n\n<p>Row4</p>\n", comments[0].Text)
@@ -247,7 +259,7 @@ var xmlTestWP = `
 			<wp:comment_author_IP><![CDATA[128.243.253.117]]></wp:comment_author_IP>
 			<wp:comment_date><![CDATA[2010-08-18 15:19:14]]></wp:comment_date>
 			<wp:comment_date_gmt><![CDATA[2010-08-18 15:19:14]]></wp:comment_date_gmt>
-			<wp:comment_content><![CDATA[Mekkatorque was over in that tent up to the right]]></wp:comment_content>
+			<wp:comment_content><![CDATA["Mekkatorque" was over in that tent up to the right]]></wp:comment_content>
 			<wp:comment_approved><![CDATA[1]]></wp:comment_approved>
 			<wp:comment_type><![CDATA[]]></wp:comment_type>
 			<wp:comment_parent>13</wp:comment_parent>
@@ -261,7 +273,9 @@ var xmlTestWP = `
 // parts of unused xml tags are omitted
 var xmlTestWPmd = `
 <?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0">
 <channel>
+	<wp:wxr_version>1.2</wp:wxr_version>
 	<item>
 		<title>Deploying RancherOS on Vultr instances</title>
 		<link>https://realmenweardress.es/2016/07/deploying-rancheros-on-vultr-instances/</link>

@@ -8,24 +8,29 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
-	"github.com/go-chi/render"
-	"github.com/go-pkgz/auth/token"
+	"github.com/go-pkgz/auth/v2/token"
 	"github.com/go-pkgz/lgr"
 	R "github.com/go-pkgz/rest"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/umputun/remark42/backend/app/notify"
+	"github.com/umputun/remark42/backend/app/rest/proxy"
 	"github.com/umputun/remark42/backend/app/store"
+	"github.com/umputun/remark42/backend/app/store/engine"
 	"github.com/umputun/remark42/backend/app/store/image"
 )
 
@@ -38,20 +43,127 @@ func TestRest_Create(t *testing.T) {
 	ts, _, teardown := startupT(t)
 	defer teardown()
 
-	resp, err := post(t, ts.URL+"/api/v1/comment",
+	resp, err := post(t, ts.URL+"/api/v1/comment?site=remark42",
 		`{"text": "test 123", "locator":{"url": "https://radio-t.com/blah1", "site": "remark42"}}`)
 	assert.NoError(t, err)
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	assert.NoError(t, err)
 	require.Equal(t, http.StatusCreated, resp.StatusCode, string(b))
+	assert.NoError(t, resp.Body.Close())
 
 	c := R.JSON{}
 	err = json.Unmarshal(b, &c)
 	assert.NoError(t, err)
-	loc := c["locator"].(map[string]interface{})
+	loc := c["locator"].(map[string]any)
 	assert.Equal(t, "remark42", loc["site"])
 	assert.Equal(t, "https://radio-t.com/blah1", loc["url"])
 	assert.True(t, len(c["id"].(string)) > 8)
+}
+
+// based on issue https://github.com/umputun/remark42/issues/1292
+func TestRest_CreateFilteredCode(t *testing.T) {
+	ts, _, teardown := startupT(t)
+	defer teardown()
+
+	resp, err := post(t, ts.URL+"/api/v1/comment?site=remark42",
+		`{"text": "`+"`foo<bar>`"+`", "locator":{"url": "https://radio-t.com/blah1", "site": "remark42"}}`)
+	assert.NoError(t, err)
+	b, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err)
+	require.Equal(t, http.StatusCreated, resp.StatusCode, string(b))
+	assert.NoError(t, resp.Body.Close())
+
+	c := R.JSON{}
+	err = json.Unmarshal(b, &c)
+	require.NoError(t, err, string(b))
+	loc := c["locator"].(map[string]any)
+	assert.Equal(t, "remark42", loc["site"])
+	assert.Equal(t, "https://radio-t.com/blah1", loc["url"])
+	assert.Equal(t, "`foo<bar>`", c["orig"])
+	assert.Contains(t, c["text"], "foo")
+	assert.Contains(t, c["text"], "bar")
+	assert.True(t, len(c["id"].(string)) > 8)
+}
+
+// based on issue https://github.com/umputun/remark42/issues/1631
+func TestRest_CreateAndPreviewWithImage(t *testing.T) {
+	ts, srv, teardown := startupT(t)
+	ts.Close()
+	defer teardown()
+
+	srv.ImageService.ProxyAPI = srv.RemarkURL + "/api/v1/img"
+	srv.ImageProxy = &proxy.Image{
+		HTTP2HTTPS:    true,
+		CacheExternal: true,
+		RoutePath:     "/api/v1/img",
+		RemarkURL:     srv.RemarkURL,
+		ImageService:  srv.ImageService,
+		Transport:     http.DefaultTransport,
+	}
+	srv.CommentFormatter = store.NewCommentFormatter(srv.ImageProxy)
+	// need to recreate the server with new ImageProxy, otherwise old one will be used
+	ts = httptest.NewServer(srv.routes())
+	defer ts.Close()
+
+	var pngRead bool
+	// server with the test PNG image
+	pngServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, e := io.Copy(w, gopherPNG())
+		assert.NoError(t, e)
+		pngRead = true
+	}))
+	defer pngServer.Close()
+
+	t.Run("create", func(t *testing.T) {
+		resp, err := post(t, ts.URL+"/api/v1/comment?site=remark42",
+			`{"text": "![](`+pngServer.URL+`/gopher.png)", "locator":{"url": "https://radio-t.com/blah1", "site": "remark42"}}`)
+		assert.NoError(t, err)
+		b, err := io.ReadAll(resp.Body)
+		assert.NoError(t, err)
+		require.Equal(t, http.StatusCreated, resp.StatusCode, string(b))
+		assert.NoError(t, resp.Body.Close())
+
+		c := R.JSON{}
+		err = json.Unmarshal(b, &c)
+		require.NoError(t, err, string(b))
+		assert.NotContains(t, c["text"], pngServer.URL)
+		assert.Contains(t, c["text"], srv.RemarkURL)
+		loc := c["locator"].(map[string]any)
+		assert.Equal(t, "remark42", loc["site"])
+		assert.Equal(t, "https://radio-t.com/blah1", loc["url"])
+		assert.True(t, len(c["id"].(string)) > 8)
+		assert.Equal(t, false, pngRead, "original image is not yet accessed by server")
+	})
+
+	t.Run("preview", func(t *testing.T) {
+		resp, err := post(t, ts.URL+"/api/v1/preview",
+			`{"text": "![](`+pngServer.URL+`/gopher.png)", "locator":{"url": "https://radio-t.com/blah1", "site": "remark42"}}`)
+		assert.NoError(t, err)
+		b, err := io.ReadAll(resp.Body)
+		assert.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode, string(b))
+		assert.NoError(t, resp.Body.Close())
+
+		assert.NotContains(t, string(b), pngServer.URL)
+		assert.Contains(t, string(b), srv.RemarkURL)
+
+		assert.Equal(t, false, pngRead, "original image is not yet accessed by server")
+		// retrieve the image from the cache
+		imgURL, _, _ := strings.Cut(strings.Split(string(b), "src=\"")[1], "\"")
+		// replace srv.RemarkURL with ts.URL
+		imgURL = strings.ReplaceAll(imgURL, srv.RemarkURL, ts.URL)
+		resp, err = http.Get(imgURL)
+		assert.NoError(t, err)
+		b, err = io.ReadAll(resp.Body)
+		assert.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode, string(b))
+		assert.NoError(t, resp.Body.Close())
+		// compare image to original gopher png after decoding from base64
+		assert.Equal(t, gopher, base64.StdEncoding.EncodeToString(b))
+
+		assert.Equal(t, true, pngRead, "original image accessed to be shown to user")
+	})
+
 }
 
 func TestRest_CreateOldPost(t *testing.T) {
@@ -69,7 +181,7 @@ func TestRest_CreateOldPost(t *testing.T) {
 	assert.Equal(t, 1, len(comments))
 
 	// try to add new comment to the same old post
-	resp, err := post(t, ts.URL+"/api/v1/comment",
+	resp, err := post(t, ts.URL+"/api/v1/comment?site=remark42",
 		`{"text": "test 123", "locator":{"site": "remark42","url": "https://radio-t.com/blah1"}}`)
 	assert.NoError(t, err)
 	assert.NoError(t, resp.Body.Close())
@@ -82,7 +194,7 @@ func TestRest_CreateOldPost(t *testing.T) {
 	_, err = srv.DataService.Create(old)
 	assert.NoError(t, err)
 
-	resp, err = post(t, ts.URL+"/api/v1/comment",
+	resp, err = post(t, ts.URL+"/api/v1/comment?site=remark42",
 		`{"text": "test 123", "locator":{"site": "remark42","url": "https://radio-t.com/blah1"}}`)
 	assert.NoError(t, err)
 	assert.NoError(t, resp.Body.Close())
@@ -95,11 +207,12 @@ func TestRest_CreateTooBig(t *testing.T) {
 
 	longComment := fmt.Sprintf(`{"text": "%4001s", "locator":{"url": "https://radio-t.com/blah1", "site": "remark42"}}`, "Щ")
 
-	resp, err := post(t, ts.URL+"/api/v1/comment", longComment)
+	resp, err := post(t, ts.URL+"/api/v1/comment?site=remark42", longComment)
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	assert.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
 	c := R.JSON{}
 	err = json.Unmarshal(b, &c)
 	assert.NoError(t, err)
@@ -107,11 +220,12 @@ func TestRest_CreateTooBig(t *testing.T) {
 	assert.Equal(t, "invalid comment", c["details"])
 
 	veryLongComment := fmt.Sprintf(`{"text": "%70000s", "locator":{"url": "https://radio-t.com/blah1", "site": "remark42"}}`, "Щ")
-	resp, err = post(t, ts.URL+"/api/v1/comment", veryLongComment)
+	resp, err = post(t, ts.URL+"/api/v1/comment?site=remark42", veryLongComment)
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	b, err = ioutil.ReadAll(resp.Body)
+	b, err = io.ReadAll(resp.Body)
 	assert.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
 	c = R.JSON{}
 	err = json.Unmarshal(b, &c)
 	assert.NoError(t, err)
@@ -126,11 +240,12 @@ func TestRest_CreateWithRestrictedWord(t *testing.T) {
 	badComment := `{"text": "What the duck is that?", "locator":{"url": "https://radio-t.com/blah1",
 "site": "remark42"}}`
 
-	resp, err := post(t, ts.URL+"/api/v1/comment", badComment)
+	resp, err := post(t, ts.URL+"/api/v1/comment?site=remark42", badComment)
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	assert.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
 	c := R.JSON{}
 	err = json.Unmarshal(b, &c)
 	assert.NoError(t, err)
@@ -138,21 +253,40 @@ func TestRest_CreateWithRestrictedWord(t *testing.T) {
 	assert.Equal(t, "invalid comment", c["details"])
 }
 
-func TestRest_CreateRejected(t *testing.T) {
+func TestRest_CreateRelativeURL(t *testing.T) {
+	ts, _, teardown := startupT(t)
+	defer teardown()
 
+	// check that it's not possible to click insert URL button and not alter the URL in it (which is `url` by default)
+	relativeURLText := `{"text": "here is a link with relative URL: [google.com](url)", "locator":{"url": "https://radio-t.com/blah1", "site": "remark42"}}`
+	resp, err := post(t, ts.URL+"/api/v1/comment?site=remark42", relativeURLText)
+	assert.NoError(t, err)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	b, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
+	c := R.JSON{}
+	err = json.Unmarshal(b, &c)
+	assert.NoError(t, err)
+	assert.Equal(t, "links should start with mailto:, http:// or https://", c["error"])
+	assert.Equal(t, "invalid comment", c["details"])
+}
+
+func TestRest_CreateRejected(t *testing.T) {
 	ts, _, teardown := startupT(t)
 	defer teardown()
 	body := `{"text": "test 123", "locator":{"url": "https://radio-t.com/blah1", "site": "remark42"}}`
 
 	// try to create without auth
-	resp, err := http.Post(ts.URL+"/api/v1/comment", "", strings.NewReader(body))
+	resp, err := http.Post(ts.URL+"/api/v1/comment?site=remark42", "", strings.NewReader(body))
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
-	assert.Equal(t, 401, resp.StatusCode)
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 
 	// try with wrong aud
 	client := &http.Client{Timeout: 5 * time.Second}
-	req, err := http.NewRequest("POST", ts.URL+"/api/v1/comment", strings.NewReader(body))
+	defer client.CloseIdleConnections()
+	req, err := http.NewRequest("POST", ts.URL+"/api/v1/comment?site=remark42", strings.NewReader(body))
 	require.NoError(t, err)
 	req.Header.Add("X-JWT", devTokenBadAud)
 	resp, err = client.Do(req)
@@ -161,16 +295,39 @@ func TestRest_CreateRejected(t *testing.T) {
 	require.Equal(t, http.StatusForbidden, resp.StatusCode, "reject wrong aud")
 }
 
+func TestRest_CreateWithWrongImage(t *testing.T) {
+	ts, srv, teardown := startupT(t)
+	defer teardown()
+
+	// create comment
+	resp, err := post(t, ts.URL+"/api/v1/comment?site=remark42", fmt.Sprintf(`{"text": "![non-existent.jpg](%s/api/v1/picture/dev_user/bad_picture)", "locator":{"url": "https://radio-t.com/blah1", "site": "radio-t"}}`, srv.RemarkURL))
+	assert.NoError(t, err)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	b, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
+	assert.Contains(t,
+		string(b),
+		"{\"code\":20,\"details\":\"can't load picture from the comment\","+
+			"\"error\":\"can't get image file for dev_user/bad_picture: can't get image stats for dev_user/bad_picture: stat ",
+	)
+	assert.Contains(t,
+		string(b),
+		"/pics-remark42/staging/dev_user/62/bad_picture: no such file or directory\"}\n",
+	)
+}
+
 func TestRest_CreateWithLazyImage(t *testing.T) {
 	ts, _, teardown := startupT(t)
 	defer teardown()
 	body := `{"text": "test 123 ![](http://example.com/image.png)", "locator":{"url": "https://radio-t.com/blah1", "site": "remark42"}}`
 	// create comment
-	resp, err := post(t, ts.URL+"/api/v1/comment", body)
+	resp, err := post(t, ts.URL+"/api/v1/comment?site=remark42", body)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	assert.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
 	c := store.Comment{}
 	err = json.Unmarshal(b, &c)
 	assert.NoError(t, err)
@@ -182,12 +339,13 @@ func TestRest_CreateAndGet(t *testing.T) {
 	defer teardown()
 
 	// create comment
-	resp, err := post(t, ts.URL+"/api/v1/comment",
+	resp, err := post(t, ts.URL+"/api/v1/comment?site=remark42",
 		`{"text": "**test** *123*\n\n http://radio-t.com", "locator":{"url": "https://radio-t.com/blah1", "site": "remark42"}}`)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	assert.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
 	c := R.JSON{}
 	err = json.Unmarshal(b, &c)
 	assert.NoError(t, err)
@@ -196,7 +354,7 @@ func TestRest_CreateAndGet(t *testing.T) {
 
 	// get created comment by id as admin
 	res, code := getWithAdminAuth(t, fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah1", ts.URL, id))
-	assert.Equal(t, 200, code)
+	assert.Equal(t, http.StatusOK, code)
 	comment := store.Comment{}
 	err = json.Unmarshal([]byte(res), &comment)
 	assert.NoError(t, err)
@@ -208,11 +366,61 @@ func TestRest_CreateAndGet(t *testing.T) {
 
 	// get created comment by id as non-admin
 	res, code = getWithDevAuth(t, fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah1", ts.URL, id))
-	assert.Equal(t, 200, code)
+	assert.Equal(t, http.StatusOK, code)
 	comment = store.Comment{}
 	err = json.Unmarshal([]byte(res), &comment)
 	assert.NoError(t, err)
 	assert.Equal(t, store.User{Name: "admin", ID: "admin", Admin: true, Blocked: false, IP: ""}, comment.User, "no ip")
+}
+
+func TestRest_CreateWithQuotes(t *testing.T) {
+	ts, srv, teardown := startupT(t)
+	defer teardown()
+
+	// create comment with quotes with smartypants
+	resp, err := post(t, ts.URL+"/api/v1/comment?site=remark42",
+		`{"text": "smartpants \"quoted\" text", "locator":{"url": "https://radio-t.com/blah1", "site": "remark42"}}`)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	b, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
+	c := R.JSON{}
+	err = json.Unmarshal(b, &c)
+	assert.NoError(t, err)
+	id := c["id"].(string)
+
+	// get created comment by id as non-admin
+	res, code := getWithDevAuth(t, fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah1", ts.URL, id))
+	assert.Equal(t, http.StatusOK, code)
+	comment := store.Comment{}
+	err = json.Unmarshal([]byte(res), &comment)
+	assert.NoError(t, err)
+	assert.Equal(t, "<p>smartpants «quoted» text</p>\n", comment.Text)
+	assert.Equal(t, "smartpants \"quoted\" text", comment.Orig)
+
+	// create comment with quotes without smartypants
+	srv.privRest.disableFancyTextFormatting = true
+	resp, err = post(t, ts.URL+"/api/v1/comment?site=remark42",
+		`{"text": "no_smartpants \"quoted\" text", "locator":{"url": "https://radio-t.com/blah1", "site": "remark42"}}`)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	b, err = io.ReadAll(resp.Body)
+	assert.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
+	c = R.JSON{}
+	err = json.Unmarshal(b, &c)
+	assert.NoError(t, err)
+	id = c["id"].(string)
+
+	// get created comment by id as non-admin
+	res, code = getWithDevAuth(t, fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah1", ts.URL, id))
+	assert.Equal(t, http.StatusOK, code)
+	comment = store.Comment{}
+	err = json.Unmarshal([]byte(res), &comment)
+	assert.NoError(t, err)
+	assert.Equal(t, "<p>no_smartpants &#34;quoted&#34; text</p>\n", comment.Text)
+	assert.Equal(t, "no_smartpants \"quoted\" text", comment.Orig)
 }
 
 func TestRest_Update(t *testing.T) {
@@ -224,15 +432,18 @@ func TestRest_Update(t *testing.T) {
 	id := addComment(t, c1, ts)
 
 	client := http.Client{}
+	defer client.CloseIdleConnections()
 	req, err := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/comment/"+id+"?site=remark42&url=https://radio-t.com/blah1",
 		strings.NewReader(`{"text":"updated text", "summary":"my edit"}`))
 	assert.NoError(t, err)
 	req.Header.Add("X-JWT", devToken)
+	beforeUpdate := time.Now()
 	b, err := client.Do(req)
 	assert.NoError(t, err)
-	body, err := ioutil.ReadAll(b.Body)
+	body, err := io.ReadAll(b.Body)
 	assert.NoError(t, err)
-	assert.Equal(t, 200, b.StatusCode, string(body))
+	assert.Equal(t, http.StatusOK, b.StatusCode, string(body))
+	assert.NoError(t, b.Body.Close())
 
 	// comments returned by update
 	c2 := store.Comment{}
@@ -242,11 +453,11 @@ func TestRest_Update(t *testing.T) {
 	assert.Equal(t, "<p>updated text</p>\n", c2.Text)
 	assert.Equal(t, "updated text", c2.Orig)
 	assert.Equal(t, "my edit", c2.Edit.Summary)
-	assert.True(t, time.Since(c2.Edit.Timestamp) < 1*time.Second)
+	assert.WithinRange(t, c2.Edit.Timestamp, beforeUpdate, time.Now(), "edit stamped during the update")
 
 	// read updated comment
 	res, code := getWithAdminAuth(t, fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah1", ts.URL, id))
-	assert.Equal(t, 200, code)
+	assert.Equal(t, http.StatusOK, code)
 	c3 := store.Comment{}
 	err = json.Unmarshal([]byte(res), &c3)
 	assert.NoError(t, err)
@@ -265,8 +476,9 @@ func TestRest_UpdateDelete(t *testing.T) {
 	resp, err := post(t, ts.URL+"/api/v1/counts?site=remark42", `["https://radio-t.com/blah1","https://radio-t.com/blah2"]`)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	bb, err := ioutil.ReadAll(resp.Body)
+	bb, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
 	j := []store.PostInfo{}
 	err = json.Unmarshal(bb, &j)
 	assert.NoError(t, err)
@@ -275,15 +487,17 @@ func TestRest_UpdateDelete(t *testing.T) {
 
 	// delete a comment
 	client := http.Client{}
+	defer client.CloseIdleConnections()
 	req, err := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/comment/"+id+"?site=remark42&url=https://radio-t.com/blah1",
 		strings.NewReader(`{"delete": true, "summary":"removed by user"}`))
 	require.NoError(t, err)
 	req.Header.Add("X-JWT", devToken)
 	b, err := client.Do(req)
 	require.NoError(t, err)
-	body, err := ioutil.ReadAll(b.Body)
+	body, err := io.ReadAll(b.Body)
 	require.NoError(t, err)
-	assert.Equal(t, 200, b.StatusCode, string(body))
+	assert.Equal(t, http.StatusOK, b.StatusCode, string(body))
+	assert.NoError(t, b.Body.Close())
 
 	// comments returned by update
 	c2 := store.Comment{}
@@ -294,7 +508,7 @@ func TestRest_UpdateDelete(t *testing.T) {
 
 	// read updated comment
 	res, code := getWithDevAuth(t, fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah1", ts.URL, id))
-	assert.Equal(t, 200, code)
+	assert.Equal(t, http.StatusOK, code)
 	c3 := store.Comment{}
 	err = json.Unmarshal([]byte(res), &c3)
 	assert.NoError(t, err)
@@ -306,13 +520,117 @@ func TestRest_UpdateDelete(t *testing.T) {
 	resp, err = post(t, ts.URL+"/api/v1/counts?site=remark42", `["https://radio-t.com/blah1","https://radio-t.com/blah2"]`)
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	bb, err = ioutil.ReadAll(resp.Body)
+	bb, err = io.ReadAll(resp.Body)
 	assert.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
 	j = []store.PostInfo{}
 	err = json.Unmarshal(bb, &j)
 	require.NoError(t, err)
 	assert.Equal(t, []store.PostInfo{{URL: "https://radio-t.com/blah1", Count: 0},
 		{URL: "https://radio-t.com/blah2", Count: 0}}, j)
+}
+
+func TestRest_DeleteChildThenParent(t *testing.T) {
+	ts, _, teardown := startupT(t)
+	defer teardown()
+
+	p := store.Comment{Text: "test test #1",
+		Locator: store.Locator{SiteID: "remark42", URL: "https://radio-t.com/blah1"}}
+	idP := addComment(t, p, ts)
+
+	c1 := store.Comment{Text: "test test #1", ParentID: idP,
+		Locator: store.Locator{SiteID: "remark42", URL: "https://radio-t.com/blah1"}}
+	idC1 := addComment(t, c1, ts)
+
+	c2 := store.Comment{Text: "test test #1", ParentID: idP,
+		Locator: store.Locator{SiteID: "remark42", URL: "https://radio-t.com/blah1"}}
+	idC2 := addComment(t, c2, ts)
+
+	// check multi count equals two
+	resp, err := post(t, ts.URL+"/api/v1/counts?site=remark42", `["https://radio-t.com/blah1"]`)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	bb, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
+	j := []store.PostInfo{}
+	err = json.Unmarshal(bb, &j)
+	assert.NoError(t, err)
+	assert.Equal(t, []store.PostInfo{{URL: "https://radio-t.com/blah1", Count: 3}}, j)
+
+	// update a parent comment fails after child is created
+	client := http.Client{}
+	defer client.CloseIdleConnections()
+	req, err := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/comment/"+idP+"?site=remark42&url=https://radio-t.com/blah1",
+		strings.NewReader(`{"text": "updated text", "summary":"updated by user"}`))
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	b, err := client.Do(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(b.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusBadRequest, b.StatusCode, string(body))
+	assert.NoError(t, b.Body.Close())
+
+	// delete first child comment
+	req, err = http.NewRequest(http.MethodPut, ts.URL+"/api/v1/comment/"+idC1+"?site=remark42&url=https://radio-t.com/blah1",
+		strings.NewReader(`{"delete": true, "summary":"removed by user"}`))
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	b, err = client.Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(b.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, b.StatusCode, string(body))
+	assert.NoError(t, b.Body.Close())
+
+	// delete a parent comment, fails as one comment child still present
+	defer client.CloseIdleConnections()
+	req, err = http.NewRequest(http.MethodPut, ts.URL+"/api/v1/comment/"+idP+"?site=remark42&url=https://radio-t.com/blah1",
+		strings.NewReader(`{"delete": true, "summary":"removed by user"}`))
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	b, err = client.Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(b.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusBadRequest, b.StatusCode, string(body))
+	assert.NoError(t, b.Body.Close())
+
+	// delete second child comment, as an admin to check both deletion methods
+	req, err = http.NewRequest(http.MethodDelete,
+		fmt.Sprintf("%s/api/v1/admin/comment/%s?site=remark42&url=https://radio-t.com/blah1", ts.URL, idC2), http.NoBody)
+	require.NoError(t, err)
+	requireAdminOnly(t, req)
+	resp, err = sendReq(req, adminUmputunToken)
+	assert.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// delete a parent comment, shouldn't fail after children are deleted
+	defer client.CloseIdleConnections()
+	req, err = http.NewRequest(http.MethodPut, ts.URL+"/api/v1/comment/"+idP+"?site=remark42&url=https://radio-t.com/blah1",
+		strings.NewReader(`{"delete": true, "summary":"removed by user"}`))
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	b, err = client.Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(b.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, b.StatusCode, string(body))
+	assert.NoError(t, b.Body.Close())
+
+	// check multi count decremented to zero
+	resp, err = post(t, ts.URL+"/api/v1/counts?site=remark42", `["https://radio-t.com/blah1"]`)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	bb, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
+	j = []store.PostInfo{}
+	err = json.Unmarshal(bb, &j)
+	assert.NoError(t, err)
+	assert.Equal(t, []store.PostInfo{{URL: "https://radio-t.com/blah1", Count: 0}}, j)
 }
 
 func TestRest_UpdateNotOwner(t *testing.T) {
@@ -325,19 +643,19 @@ func TestRest_UpdateNotOwner(t *testing.T) {
 	assert.NoError(t, err)
 
 	client := http.Client{}
+	defer client.CloseIdleConnections()
 	req, err := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/comment/"+id1+
 		"?site=remark42&url=https://radio-t.com/blah1", strings.NewReader(`{"text":"updated text", "summary":"my edit"}`))
 	assert.NoError(t, err)
 	req.Header.Add("X-JWT", devToken)
 	b, err := client.Do(req)
 	assert.NoError(t, err)
-	body, err := ioutil.ReadAll(b.Body)
+	body, err := io.ReadAll(b.Body)
 	assert.NoError(t, err)
 	assert.NoError(t, b.Body.Close())
-	assert.Equal(t, 403, b.StatusCode, string(body), "update from non-owner")
+	assert.Equal(t, http.StatusForbidden, b.StatusCode, string(body), "update from non-owner")
 	assert.Equal(t, `{"code":3,"details":"can not edit comments for other users","error":"rejected"}`+"\n", string(body))
 
-	client = http.Client{}
 	req, err = http.NewRequest(http.MethodPut, ts.URL+"/api/v1/comment/"+id1+
 		"?site=remark42&url=https://radio-t.com/blah1", strings.NewReader(`ERRR "text":"updated text", "summary":"my"}`))
 	assert.NoError(t, err)
@@ -345,7 +663,7 @@ func TestRest_UpdateNotOwner(t *testing.T) {
 	b, err = client.Do(req)
 	assert.NoError(t, err)
 	assert.NoError(t, b.Body.Close())
-	assert.Equal(t, 400, b.StatusCode, string(body), "update is not json")
+	assert.Equal(t, http.StatusBadRequest, b.StatusCode, string(body), "update is not json")
 }
 
 func TestRest_UpdateWrongAud(t *testing.T) {
@@ -357,6 +675,7 @@ func TestRest_UpdateWrongAud(t *testing.T) {
 	id := addComment(t, c1, ts)
 
 	client := http.Client{}
+	defer client.CloseIdleConnections()
 	req, err := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/comment/"+id+"?site=remark42&url=https://radio-t.com/blah1",
 		strings.NewReader(`{"text":"updated text", "summary":"my edit"}`))
 	assert.NoError(t, err)
@@ -376,18 +695,20 @@ func TestRest_UpdateWithRestrictedWords(t *testing.T) {
 	id := addComment(t, c1, ts)
 
 	client := http.Client{}
+	defer client.CloseIdleConnections()
 	req, err := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/comment/"+id+"?site=remark42&url=https://radio-t.com/blah1",
 		strings.NewReader(`{"text":"What the duck is that?", "summary":"my edit"}`))
 	assert.NoError(t, err)
 	req.Header.Add("X-JWT", devToken)
 	b, err := client.Do(req)
 	assert.NoError(t, err)
-	body, err := ioutil.ReadAll(b.Body)
+	body, err := io.ReadAll(b.Body)
 	assert.NoError(t, err)
+	assert.NoError(t, b.Body.Close())
 	c := R.JSON{}
 	err = json.Unmarshal(body, &c)
 	assert.NoError(t, err)
-	assert.Equal(t, 400, b.StatusCode, string(body))
+	assert.Equal(t, http.StatusBadRequest, b.StatusCode, string(body))
 	assert.Equal(t, "comment contains restricted words", c["error"])
 	assert.Equal(t, "invalid comment", c["details"])
 }
@@ -406,20 +727,21 @@ func TestRest_Vote(t *testing.T) {
 
 	vote := func(val int) int {
 		client := http.Client{}
+		defer client.CloseIdleConnections()
 		req, err := http.NewRequest(http.MethodPut,
-			fmt.Sprintf("%s/api/v1/vote/%s?site=remark42&url=https://radio-t.com/blah&vote=%d", ts.URL, id1, val), nil)
+			fmt.Sprintf("%s/api/v1/vote/%s?site=remark42&url=https://radio-t.com/blah&vote=%d", ts.URL, id1, val), http.NoBody)
 		assert.NoError(t, err)
-		req.Header.Add("X-JWT", devToken)
+		req.Header.Add("X-JWT", dev2Token)
 		resp, err := client.Do(req)
 		assert.NoError(t, err)
 		assert.NoError(t, resp.Body.Close())
 		return resp.StatusCode
 	}
 
-	assert.Equal(t, 200, vote(1), "first vote allowed")
-	assert.Equal(t, 400, vote(1), "second vote rejected")
-	body, code := getWithDevAuth(t, fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah", ts.URL, id1))
-	assert.Equal(t, 200, code)
+	assert.Equal(t, http.StatusOK, vote(1), "first vote allowed")
+	assert.Equal(t, http.StatusBadRequest, vote(1), "second vote rejected")
+	body, code := getWithDev2Auth(t, fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah", ts.URL, id1))
+	assert.Equal(t, http.StatusOK, code)
 	cr := store.Comment{}
 	err := json.Unmarshal([]byte(body), &cr)
 	assert.NoError(t, err)
@@ -428,27 +750,27 @@ func TestRest_Vote(t *testing.T) {
 	assert.Equal(t, map[string]bool(nil), cr.Votes, "hidden")
 	assert.Equal(t, map[string]store.VotedIPInfo(nil), cr.VotedIPs, "hidden")
 
-	assert.Equal(t, 200, vote(-1), "opposite vote allowed")
-	body, code = getWithDevAuth(t, fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah", ts.URL, id1))
-	assert.Equal(t, 200, code)
+	assert.Equal(t, http.StatusOK, vote(-1), "opposite vote allowed")
+	body, code = getWithDev2Auth(t, fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah", ts.URL, id1))
+	assert.Equal(t, http.StatusOK, code)
 	cr = store.Comment{}
 	err = json.Unmarshal([]byte(body), &cr)
 	assert.NoError(t, err)
 	assert.Equal(t, 0, cr.Score)
 	assert.Equal(t, 0, cr.Vote)
 
-	assert.Equal(t, 200, vote(-1), "opposite vote allowed one more time")
-	body, code = getWithDevAuth(t, fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah", ts.URL, id1))
-	assert.Equal(t, 200, code)
+	assert.Equal(t, http.StatusOK, vote(-1), "opposite vote allowed one more time")
+	body, code = getWithDev2Auth(t, fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah", ts.URL, id1))
+	assert.Equal(t, http.StatusOK, code)
 	cr = store.Comment{}
 	err = json.Unmarshal([]byte(body), &cr)
 	assert.NoError(t, err)
 	assert.Equal(t, -1, cr.Score)
 	assert.Equal(t, -1, cr.Vote)
 
-	assert.Equal(t, 400, vote(-1), "dbl vote not allowed")
-	body, code = getWithDevAuth(t, fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah", ts.URL, id1))
-	assert.Equal(t, 200, code)
+	assert.Equal(t, http.StatusBadRequest, vote(-1), "dbl vote not allowed")
+	body, code = getWithDev2Auth(t, fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah", ts.URL, id1))
+	assert.Equal(t, http.StatusOK, code)
 	cr = store.Comment{}
 	err = json.Unmarshal([]byte(body), &cr)
 	assert.NoError(t, err)
@@ -456,7 +778,7 @@ func TestRest_Vote(t *testing.T) {
 	assert.Equal(t, -1, cr.Vote)
 
 	body, code = get(t, fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah", ts.URL, id1))
-	assert.Equal(t, 200, code)
+	assert.Equal(t, http.StatusOK, code)
 	cr = store.Comment{}
 	err = json.Unmarshal([]byte(body), &cr)
 	assert.NoError(t, err)
@@ -466,14 +788,15 @@ func TestRest_Vote(t *testing.T) {
 	assert.Equal(t, map[string]store.VotedIPInfo(nil), cr.VotedIPs, "hidden")
 
 	req, err := http.NewRequest("GET",
-		fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah", ts.URL, id1), nil)
+		fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah", ts.URL, id1), http.NoBody)
 	assert.NoError(t, err)
-	resp, err := sendReq(t, req, adminUmputunToken)
+	resp, err := sendReq(req, adminUmputunToken)
 	assert.NoError(t, err)
-	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	cr = store.Comment{}
 	err = json.NewDecoder(resp.Body).Decode(&cr)
 	assert.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
 	assert.Equal(t, -1, cr.Score)
 	assert.Equal(t, 0, cr.Vote, "no vote info for different user")
 	assert.Equal(t, map[string]bool(nil), cr.Votes, "hidden")
@@ -481,49 +804,63 @@ func TestRest_Vote(t *testing.T) {
 }
 
 func TestRest_AnonVote(t *testing.T) {
-	ts, srv, teardown := startupT(t)
-	defer teardown()
+	// startServer starts a server with two comments and returns it with the id of the first one
+	startServer := func(anonVote bool) (ts *httptest.Server, id1 string) {
+		ts, _, teardown := startupT(t, func(srv *Rest) { srv.AnonVote = anonVote })
+		t.Cleanup(teardown)
 
-	c1 := store.Comment{Text: "test test #1",
-		Locator: store.Locator{SiteID: "remark42", URL: "https://radio-t.com/blah"}}
-	c2 := store.Comment{Text: "test test #2", ParentID: "p1",
-		Locator: store.Locator{SiteID: "remark42", URL: "https://radio-t.com/blah"}}
+		c1 := store.Comment{Text: "test test #1",
+			Locator: store.Locator{SiteID: "remark42", URL: "https://radio-t.com/blah"}}
+		c2 := store.Comment{Text: "test test #2", ParentID: "p1",
+			Locator: store.Locator{SiteID: "remark42", URL: "https://radio-t.com/blah"}}
 
-	id1 := addComment(t, c1, ts)
-	addComment(t, c2, ts)
+		id1 = addComment(t, c1, ts)
+		addComment(t, c2, ts)
+		return ts, id1
+	}
 
-	vote := func(val int) int {
+	vote := func(ts *httptest.Server, id string, val int) (body string, code int) {
 		client := http.Client{}
+		defer client.CloseIdleConnections()
 		req, err := http.NewRequest(http.MethodPut,
-			fmt.Sprintf("%s/api/v1/vote/%s?site=remark42&url=https://radio-t.com/blah&vote=%d", ts.URL, id1, val), nil)
-		assert.NoError(t, err)
+			fmt.Sprintf("%s/api/v1/vote/%s?site=remark42&url=https://radio-t.com/blah&vote=%d", ts.URL, id, val), http.NoBody)
+		require.NoError(t, err)
 		req.Header.Add("X-JWT", anonToken)
 		resp, err := client.Do(req)
-		assert.NoError(t, err)
-		assert.NoError(t, resp.Body.Close())
-		return resp.StatusCode
+		require.NoError(t, err)
+		b, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		return string(b), resp.StatusCode
 	}
 
 	getWithAnonAuth := func(url string) (body string, code int) {
 		client := &http.Client{Timeout: 5 * time.Second}
-		req, err := http.NewRequest("GET", url, nil)
+		defer client.CloseIdleConnections()
+		req, err := http.NewRequest("GET", url, http.NoBody)
 		require.NoError(t, err)
 		req.Header.Add("X-JWT", anonToken)
 		r, err := client.Do(req)
 		require.NoError(t, err)
 		defer r.Body.Close()
-		b, err := ioutil.ReadAll(r.Body)
+		b, err := io.ReadAll(r.Body)
 		assert.NoError(t, err)
 		return string(b), r.StatusCode
 	}
 
-	assert.Equal(t, 403, vote(1), "vote is disallowed with anonVote false")
-	srv.privRest.anonVote = true
-	assert.Equal(t, 200, vote(1), "first vote allowed")
-	assert.Equal(t, 400, vote(1), "second vote rejected")
-	body, code := getWithAnonAuth(fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah", ts.URL, id1))
+	ts, id1 := startServer(false)
+	body, code := vote(ts, id1, 1)
+	assert.Equal(t, http.StatusForbidden, code, "vote is disallowed with anonVote false")
+	assert.Equal(t, "Access denied\n", body)
 
-	assert.Equal(t, 200, code)
+	ts, id1 = startServer(true)
+	_, code = vote(ts, id1, 1)
+	assert.Equal(t, http.StatusOK, code, "first vote allowed")
+	_, code = vote(ts, id1, 1)
+	assert.Equal(t, http.StatusBadRequest, code, "second vote rejected")
+	body, code = getWithAnonAuth(fmt.Sprintf("%s/api/v1/id/%s?site=remark42&url=https://radio-t.com/blah", ts.URL, id1))
+
+	assert.Equal(t, http.StatusOK, code)
 	cr := store.Comment{}
 	err := json.Unmarshal([]byte(body), &cr)
 	assert.NoError(t, err)
@@ -533,27 +870,19 @@ func TestRest_AnonVote(t *testing.T) {
 	assert.Equal(t, map[string]store.VotedIPInfo(nil), cr.VotedIPs)
 }
 
-type MockFS struct{}
-
-func (fs *MockFS) ReadFile(path string) ([]byte, error) {
-	return []byte(fmt.Sprintf("template %s", path)), nil
-}
-
-func TestRest_Email(t *testing.T) {
+func TestRest_EmailAndTelegram(t *testing.T) {
 	ts, srv, teardown := startupT(t)
 	defer teardown()
 
-	srv.privRest.templates = &MockFS{}
+	srv.privRest.telegramService = &mockTelegram{site: "remark42"}
 
 	// issue good token
 	claims := token.Claims{
-		Handshake: &token.Handshake{ID: "dev::good@example.com"},
-		StandardClaims: jwt.StandardClaims{
-			Audience:  "remark42",
-			ExpiresAt: time.Now().Add(10 * time.Minute).Unix(),
-			NotBefore: time.Now().Add(-1 * time.Minute).Unix(),
-			Issuer:    "remark42",
-		},
+		Handshake: &token.Handshake{ID: "provider1_dev::good@example.com"},
+		Audience:  jwt.ClaimStrings{"remark42"},
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(10 * time.Minute)),
+		NotBefore: jwt.NewNumericDate(time.Now().Add(-1 * time.Minute)),
+		Issuer:    "remark42",
 	}
 	tkn, err := srv.Authenticator.TokenService().Token(claims)
 	require.NoError(t, err)
@@ -566,37 +895,61 @@ func TestRest_Email(t *testing.T) {
 		responseCode int
 		noAuth       bool
 		cookieEmail  string
+		body         string
 	}{
 		{description: "issue delete request without auth", url: "/api/v1/email", method: http.MethodDelete, responseCode: http.StatusUnauthorized, noAuth: true},
-		{description: "issue delete request without site_id", url: "/api/v1/email", method: http.MethodDelete, responseCode: http.StatusBadRequest},
+		{description: "issue delete request without site_id", url: "/api/v1/email", method: http.MethodDelete, responseCode: http.StatusForbidden},
 		{description: "delete non-existent user email", url: "/api/v1/email?site=remark42", method: http.MethodDelete, responseCode: http.StatusOK},
-		{description: "set user email, token not set", url: "/api/v1/email/confirm?site=remark42", method: http.MethodPost, responseCode: http.StatusBadRequest},
-		{description: "send confirmation without address", url: "/api/v1/email/subscribe?site=remark42", method: http.MethodPost, responseCode: http.StatusBadRequest},
-		{description: "send confirmation", url: "/api/v1/email/subscribe?site=remark42&address=good@example.com", method: http.MethodPost, responseCode: http.StatusOK},
-		{description: "set user email, token is good", url: fmt.Sprintf("/api/v1/email/confirm?site=remark42&tkn=%s", goodToken), method: http.MethodPost, responseCode: http.StatusOK, cookieEmail: "good@example.com"},
+		{description: "set user email, token not set", url: "/api/v1/email/confirm?site=remark42", method: http.MethodPost, responseCode: http.StatusBadRequest, body: `{"site":"remark42"}`},
+		{description: "set user email, token not set, old query param", url: "/api/v1/email/confirm?site=remark42", method: http.MethodPost, responseCode: http.StatusBadRequest},
+		{description: "send email confirmation without address", url: "/api/v1/email/subscribe?site=remark42", method: http.MethodPost, responseCode: http.StatusBadRequest, body: `{"site":"remark42"}`},
+		{description: "send email confirmation without address, old query param", url: "/api/v1/email/subscribe?site=remark42", method: http.MethodPost, responseCode: http.StatusBadRequest},
+		{description: "send email confirmation", url: "/api/v1/email/subscribe?site=remark42", method: http.MethodPost, responseCode: http.StatusOK, body: `{"site":"remark42","address":"good@example.com"}`},
+		{description: "send email confirmation, old query param", url: "/api/v1/email/subscribe?site=remark42&address=good@example.com", method: http.MethodPost, responseCode: http.StatusOK},
+		{description: "set user email, token is good", url: "/api/v1/email/confirm?site=remark42", method: http.MethodPost, responseCode: http.StatusOK, cookieEmail: "good@example.com", body: fmt.Sprintf(`{"site":"remark42","token":%q}`, goodToken)},
+		{description: "set user email, token is good, old query param", url: fmt.Sprintf("/api/v1/email/confirm?site=remark42&tkn=%s", goodToken), method: http.MethodPost, responseCode: http.StatusOK, cookieEmail: "good@example.com"},
 		{description: "send confirmation with same address", url: "/api/v1/email/subscribe?site=remark42&address=good@example.com", method: http.MethodPost, responseCode: http.StatusConflict},
 		{description: "get user email", url: "/api/v1/email?site=remark42", method: http.MethodGet, responseCode: http.StatusOK},
 		{description: "delete user email", url: "/api/v1/email?site=remark42", method: http.MethodDelete, responseCode: http.StatusOK},
 		{description: "send another confirmation", url: "/api/v1/email/subscribe?site=remark42&address=good@example.com", method: http.MethodPost, responseCode: http.StatusOK},
-		{description: "set user email, token is good", url: fmt.Sprintf("/api/v1/email/confirm?site=remark42&tkn=%s", goodToken), method: http.MethodPost, responseCode: http.StatusOK, cookieEmail: "good@example.com"},
+		{description: "set user email, token is good", url: "/api/v1/email/confirm?site=remark42", method: http.MethodPost, responseCode: http.StatusOK, cookieEmail: "good@example.com", body: fmt.Sprintf(`{"site":"remark42","token":%q}`, goodToken)},
+		{description: "set user email, token is good, old query param", url: fmt.Sprintf("/api/v1/email/confirm?site=remark42&tkn=%s", goodToken), method: http.MethodPost, responseCode: http.StatusOK, cookieEmail: "good@example.com"},
 		{description: "unsubscribe user, no token", url: "/email/unsubscribe.html?site=remark42", method: http.MethodPost, responseCode: http.StatusBadRequest},
 		{description: "unsubscribe user, wrong token", url: "/email/unsubscribe.html?site=remark42&tkn=jwt", method: http.MethodGet, responseCode: http.StatusForbidden},
 		{description: "unsubscribe user, good token", url: fmt.Sprintf("/email/unsubscribe.html?site=remark42&tkn=%s", goodToken), method: http.MethodPost, responseCode: http.StatusOK},
 		{description: "unsubscribe user second time, good token", url: fmt.Sprintf("/email/unsubscribe.html?site=remark42&tkn=%s", goodToken), method: http.MethodPost, responseCode: http.StatusConflict},
+		{description: "issue delete request without auth", url: "/api/v1/telegram", method: http.MethodDelete, responseCode: http.StatusUnauthorized, noAuth: true},
+		{description: "issue delete request without site_id", url: "/api/v1/telegram", method: http.MethodDelete, responseCode: http.StatusForbidden},
+		{description: "delete non-existent user telegram", url: "/api/v1/telegram?site=remark42", method: http.MethodDelete, responseCode: http.StatusOK},
+		{description: "send telegram confirmation, no siteID", url: "/api/v1/telegram/subscribe", method: http.MethodGet, responseCode: http.StatusForbidden},
+		{description: "send telegram confirmation", url: "/api/v1/telegram/subscribe?site=remark42", method: http.MethodGet, responseCode: http.StatusOK},
+		{description: "set user telegram, token is good", url: "/api/v1/telegram/subscribe?site=remark42&tkn=good_token", method: http.MethodGet, responseCode: http.StatusOK},
+		{description: "send confirmation with same address", url: "/api/v1/telegram/subscribe?site=remark42", method: http.MethodGet, responseCode: http.StatusConflict},
+		{description: "delete user telegram", url: "/api/v1/telegram?site=remark42", method: http.MethodDelete, responseCode: http.StatusOK},
+		{description: "send another confirmation", url: "/api/v1/telegram/subscribe?site=remark42", method: http.MethodGet, responseCode: http.StatusOK},
+		{description: "set user telegram, token is good", url: "/api/v1/telegram/subscribe?site=remark42&tkn=good_token", method: http.MethodGet, responseCode: http.StatusOK},
+		// telegramSubscribeCtrl mutates state, so HEAD (which stdlib ServeMux would route to the
+		// GET handler) must be rejected by rejectHead before it runs
+		{description: "HEAD is rejected on telegram subscribe", url: "/api/v1/telegram/subscribe?site=remark42", method: http.MethodHead, responseCode: http.StatusMethodNotAllowed},
 	}
 	client := http.Client{}
+	defer client.CloseIdleConnections()
 	for _, x := range testData {
-		x := x
 		t.Run(x.description, func(t *testing.T) {
-			req, err := http.NewRequest(x.method, ts.URL+x.url, nil)
+			reqBody := io.NopCloser(strings.NewReader(x.body))
+			if x.body == "" {
+				reqBody = http.NoBody
+			}
+			req, err := http.NewRequest(x.method, ts.URL+x.url, reqBody)
 			require.NoError(t, err)
 			if !x.noAuth {
 				req.Header.Add("X-JWT", devToken)
 			}
 			resp, err := client.Do(req)
 			require.NoError(t, err)
-			body, err := ioutil.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
+			assert.NoError(t, resp.Body.Close())
 			// read User.Email from the token in the cookie
 			for _, c := range resp.Cookies() {
 				if c.Name == "JWT" {
@@ -610,41 +963,75 @@ func TestRest_Email(t *testing.T) {
 	}
 }
 
+// fakeDestination is a notify.Destination recording what it was asked to send
+type fakeDestination struct {
+	mu            sync.Mutex
+	requests      []notify.Request
+	verifications []notify.VerificationRequest
+}
+
+func (f *fakeDestination) Send(_ context.Context, r notify.Request) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.requests = append(f.requests, r)
+	return nil
+}
+
+func (f *fakeDestination) SendVerification(_ context.Context, v notify.VerificationRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.verifications = append(f.verifications, v)
+	return nil
+}
+
+func (f *fakeDestination) String() string { return "fake destination" }
+
+func (f *fakeDestination) Get() []notify.Request {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.requests)
+}
+
+func (f *fakeDestination) GetVerify() []notify.VerificationRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.verifications)
+}
+
 func TestRest_EmailNotification(t *testing.T) {
 	ts, srv, teardown := startupT(t)
 	defer teardown()
 
-	mockDestination := &notify.MockDest{}
+	mockDestination := &fakeDestination{}
 	srv.privRest.notifyService = notify.NewService(srv.DataService, 1, mockDestination)
 	defer srv.privRest.notifyService.Close()
 
 	client := http.Client{}
+	defer client.CloseIdleConnections()
 
 	// create new comment from dev user
-	req, err := http.NewRequest("POST", ts.URL+"/api/v1/comment", strings.NewReader(
+	req, err := http.NewRequest("POST", ts.URL+"/api/v1/comment?site=remark42", strings.NewReader(
 		`{"text": "test 123",
-"user": {"name": "dev::good@example.com"},
+"user": {"name": "provider1_dev::good@example.com"},
 "locator":{"url": "https://radio-t.com/blah1",
 "site": "remark42"}}`))
 	assert.NoError(t, err)
 	req.Header.Add("X-JWT", devToken)
 	resp, err := client.Do(req)
 	assert.NoError(t, err)
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	require.Equal(t, http.StatusCreated, resp.StatusCode, string(body))
 	parentComment := store.Comment{}
-	require.NoError(t, render.DecodeJSON(strings.NewReader(string(body)), &parentComment))
-	// wait for mock notification Submit to kick off
-	time.Sleep(time.Millisecond * 30)
-	require.Equal(t, 1, len(mockDestination.Get()))
+	require.NoError(t, json.Unmarshal(body, &parentComment))
+	waitForCount(t, 1, func() int { return len(mockDestination.Get()) })
 	assert.Empty(t, mockDestination.Get()[0].Emails)
 
 	// create child comment from another user, email notification only to admin expected
-	req, err = http.NewRequest("POST", ts.URL+"/api/v1/comment", strings.NewReader(fmt.Sprintf(
+	req, err = http.NewRequest("POST", ts.URL+"/api/v1/comment?site=remark42", strings.NewReader(fmt.Sprintf(
 		`{"text": "test 456",
-	"pid": "%s",
+	"pid": %q,
 	"user": {"name": "other_user"},
 	"locator":{"url": "https://radio-t.com/blah1",
 	"site": "remark42"}}`, parentComment.ID)))
@@ -652,62 +1039,88 @@ func TestRest_EmailNotification(t *testing.T) {
 	req.Header.Add("X-JWT", anonToken)
 	resp, err = client.Do(req)
 	assert.NoError(t, err)
-	body, err = ioutil.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	require.Equal(t, http.StatusCreated, resp.StatusCode, string(body))
-	// wait for mock notification Submit to kick off
-	time.Sleep(time.Millisecond * 30)
-	require.Equal(t, 2, len(mockDestination.Get()))
+	waitForCount(t, 2, func() int { return len(mockDestination.Get()) })
 	assert.Empty(t, mockDestination.Get()[1].Emails)
 
 	// send confirmation token for email
-	req, err = http.NewRequest(http.MethodPost, ts.URL+"/api/v1/email/subscribe?site=remark42&address=good@example.com", nil)
+	req, err = http.NewRequest(
+		http.MethodPost,
+		ts.URL+"/api/v1/email/subscribe?site=remark42",
+		io.NopCloser(strings.NewReader(`{"site": "remark42", "address": "good@example.com"}`)),
+	)
 	require.NoError(t, err)
 	req.Header.Add("X-JWT", devToken)
 	resp, err = client.Do(req)
 	require.NoError(t, err)
-	body, err = ioutil.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
-	// wait for mock notification Submit to kick off
-	time.Sleep(time.Millisecond * 30)
-	require.Equal(t, 1, len(mockDestination.GetVerify()))
+	waitForCount(t, 1, func() int { return len(mockDestination.GetVerify()) })
 	assert.Equal(t, "good@example.com", mockDestination.GetVerify()[0].Email)
 	verificationToken := mockDestination.GetVerify()[0].Token
 
-	// verify email
-	req, err = http.NewRequest(http.MethodPost, ts.URL+fmt.Sprintf("/api/v1/email/confirm?site=remark42&tkn=%s", verificationToken), nil)
+	// get user information to verify lack of the subscription
+	req, err = http.NewRequest(
+		http.MethodGet,
+		ts.URL+"/api/v1/user?site=remark42",
+		http.NoBody)
 	require.NoError(t, err)
 	req.Header.Add("X-JWT", devToken)
 	resp, err = client.Do(req)
 	require.NoError(t, err)
-	body, err = ioutil.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	var clearUser store.User
+	err = json.Unmarshal(body, &clearUser)
+	assert.NoError(t, err)
+	assert.Equal(t, store.User{Name: "developer one", ID: "provider1_dev", EmailSubscription: false,
+		Picture: "http://example.com/pic.png", IP: "127.0.0.1", SiteID: "remark42"}, clearUser)
+
+	// verify email
+	req, err = http.NewRequest(
+		http.MethodPost,
+		ts.URL+"/api/v1/email/confirm?site=remark42",
+		io.NopCloser(strings.NewReader(fmt.Sprintf(`{"site": "remark42", "token": %q}`, verificationToken))),
+	)
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 
 	// get user information to verify the subscription
-	req, err = http.NewRequest(http.MethodGet, ts.URL+"/api/v1/user?site=remark42", nil)
+	req, err = http.NewRequest(
+		http.MethodGet,
+		ts.URL+"/api/v1/user?site=remark42",
+		http.NoBody)
 	require.NoError(t, err)
 	req.Header.Add("X-JWT", devToken)
 	resp, err = client.Do(req)
 	require.NoError(t, err)
-	body, err = ioutil.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
-	var user store.User
-	err = json.Unmarshal(body, &user)
+	var subscribedUser store.User
+	err = json.Unmarshal(body, &subscribedUser)
 	assert.NoError(t, err)
-	assert.Equal(t, store.User{Name: "developer one", ID: "dev", EmailSubscription: true,
-		Picture: "http://example.com/pic.png", IP: "127.0.0.1", SiteID: "remark42"}, user)
+	assert.Equal(t, store.User{Name: "developer one", ID: "provider1_dev", EmailSubscription: true,
+		Picture: "http://example.com/pic.png", IP: "127.0.0.1", SiteID: "remark42"}, subscribedUser)
 
 	// create child comment from another user, email notification expected
-	req, err = http.NewRequest("POST", ts.URL+"/api/v1/comment", strings.NewReader(fmt.Sprintf(
+	req, err = http.NewRequest("POST", ts.URL+"/api/v1/comment?site=remark42", strings.NewReader(fmt.Sprintf(
 		`{"text": "test 789",
-	"pid": "%s",
+	"pid": %q,
 	"user": {"name": "other_user"},
 	"locator":{"url": "https://radio-t.com/blah1",
 	"site": "remark42"}}`, parentComment.ID)))
@@ -715,28 +1128,26 @@ func TestRest_EmailNotification(t *testing.T) {
 	req.Header.Add("X-JWT", anonToken)
 	resp, err = client.Do(req)
 	assert.NoError(t, err)
-	body, err = ioutil.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	require.Equal(t, http.StatusCreated, resp.StatusCode, string(body))
-	// wait for mock notification Submit to kick off
-	time.Sleep(time.Millisecond * 30)
-	require.Equal(t, 3, len(mockDestination.Get()))
+	waitForCount(t, 3, func() int { return len(mockDestination.Get()) })
 	assert.Equal(t, []string{"good@example.com"}, mockDestination.Get()[2].Emails)
 
 	// delete user's email
-	req, err = http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/email?site=remark42", nil)
+	req, err = http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/email?site=remark42", http.NoBody)
 	require.NoError(t, err)
 	req.Header.Add("X-JWT", devToken)
 	resp, err = client.Do(req)
 	require.NoError(t, err)
-	body, err = ioutil.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	assert.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 
 	// create child comment from another user, no email notification
-	req, err = http.NewRequest("POST", ts.URL+"/api/v1/comment", strings.NewReader(
+	req, err = http.NewRequest("POST", ts.URL+"/api/v1/comment?site=remark42", strings.NewReader(
 		`{"text": "test 321",
 	"user": {"name": "other_user"},
 	"locator":{"url": "https://radio-t.com/blah1",
@@ -745,14 +1156,270 @@ func TestRest_EmailNotification(t *testing.T) {
 	req.Header.Add("X-JWT", devToken)
 	resp, err = client.Do(req)
 	assert.NoError(t, err)
-	body, err = ioutil.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	require.Equal(t, http.StatusCreated, resp.StatusCode, string(body))
-	// wait for mock notification Submit to kick off
-	time.Sleep(time.Millisecond * 30)
-	require.Equal(t, 4, len(mockDestination.Get()))
+	waitForCountSettled(t, 4, func() int { return len(mockDestination.Get()) })
 	assert.Empty(t, mockDestination.Get()[3].Emails)
+
+	// confirm email via subscribe call with query params, old behavior, email notification is expected
+	req, err = http.NewRequest(
+		http.MethodPost,
+		ts.URL+"/api/v1/email/subscribe?site=remark42&address=good@example.com",
+		http.NoBody,
+	)
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", emailUserToken)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	waitForCount(t, 2, func() int { return len(mockDestination.GetVerify()) }, "verification email was sent")
+
+	// get email user information to verify there is no subscription yet
+	req, err = http.NewRequest(
+		http.MethodGet,
+		ts.URL+"/api/v1/user?site=remark42",
+		http.NoBody)
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", emailUserToken)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	var unsubscribedEmailUser store.User
+	err = json.Unmarshal(body, &unsubscribedEmailUser)
+	assert.NoError(t, err)
+	assert.Equal(t, store.User{Name: "good@example.com test user", ID: "email_f5dfe9d2e6bd75fc74ea5fabf273b45b5baeb195", EmailSubscription: false,
+		Picture: "http://example.com/pic.png", IP: "127.0.0.1", SiteID: "remark42"}, unsubscribedEmailUser)
+
+	// confirm email via subscribe call, no email notification is expected
+	req, err = http.NewRequest(
+		http.MethodPost,
+		ts.URL+"/api/v1/email/subscribe?site=remark42",
+		io.NopCloser(strings.NewReader(`{"site": "remark42", "address": "good@example.com"}`)),
+	)
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", emailUserToken)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	waitForCountSettled(t, 2, func() int { return len(mockDestination.GetVerify()) }, "no new verification email was sent")
+
+	// get email user information to verify the subscription happened without the confirmation call
+	req, err = http.NewRequest(
+		http.MethodGet,
+		ts.URL+"/api/v1/user?site=remark42",
+		http.NoBody)
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", emailUserToken)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	var subscribedEmailUser store.User
+	err = json.Unmarshal(body, &subscribedEmailUser)
+	assert.NoError(t, err)
+	assert.Equal(t, store.User{Name: "good@example.com test user", ID: "email_f5dfe9d2e6bd75fc74ea5fabf273b45b5baeb195", EmailSubscription: true,
+		Picture: "http://example.com/pic.png", IP: "127.0.0.1", SiteID: "remark42"}, subscribedEmailUser)
+}
+
+func TestRest_TelegramNotification(t *testing.T) {
+	ts, srv, teardown := startupT(t)
+	defer teardown()
+
+	mockDestination := &fakeDestination{}
+	srv.privRest.notifyService = notify.NewService(srv.DataService, 1, mockDestination)
+	defer srv.privRest.notifyService.Close()
+
+	client := http.Client{}
+	defer client.CloseIdleConnections()
+
+	// create new comment from dev user
+	req, err := http.NewRequest("POST", ts.URL+"/api/v1/comment?site=remark42", strings.NewReader(
+		`{"text": "test 123",
+"user": {"name": "provider1_dev::good@example.com"},
+"locator":{"url": "https://radio-t.com/blah1",
+"site": "remark42"}}`))
+	assert.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	resp, err := client.Do(req)
+	assert.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusCreated, resp.StatusCode, string(body))
+	parentComment := store.Comment{}
+	require.NoError(t, json.Unmarshal(body, &parentComment))
+	waitForCount(t, 1, func() int { return len(mockDestination.Get()) })
+	assert.Empty(t, mockDestination.Get()[0].Telegrams)
+
+	// create child comment from another user, telegram notification only to admin expected
+	req, err = http.NewRequest("POST", ts.URL+"/api/v1/comment?site=remark42", strings.NewReader(fmt.Sprintf(
+		`{"text": "test 456",
+	"pid": %q,
+	"user": {"name": "other_user"},
+	"locator":{"url": "https://radio-t.com/blah1",
+	"site": "remark42"}}`, parentComment.ID)))
+	assert.NoError(t, err)
+	req.Header.Add("X-JWT", anonToken)
+	resp, err = client.Do(req)
+	assert.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusCreated, resp.StatusCode, string(body))
+	waitForCount(t, 2, func() int { return len(mockDestination.Get()) })
+	assert.Empty(t, mockDestination.Get()[1].Telegrams)
+
+	// subscribe to telegram while the telegram destination is absent
+	req, err = http.NewRequest(http.MethodGet, ts.URL+"/api/v1/telegram/subscribe?site=remark42", http.NoBody)
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusInternalServerError, resp.StatusCode, string(body))
+	assert.Equal(t, `{"code":17,"details":"telegram notifications are not enabled","error":"not enabled"}`+"\n", string(body))
+
+	mockTlgrm := &mockTelegram{notVerified: true, site: "unknown_site"}
+	srv.privRest.telegramService = mockTlgrm
+	// send confirmation token for telegram
+	req, err = http.NewRequest(http.MethodGet, ts.URL+"/api/v1/telegram/subscribe?site=remark42", http.NoBody)
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	var subscribeRequest struct {
+		Bot   string `json:"bot"`
+		Token string `json:"token"`
+	}
+	err = json.Unmarshal(body, &subscribeRequest)
+	assert.NoError(t, err)
+	assert.Equal(t, "botUsername", subscribeRequest.Bot)
+
+	// verify telegram, unsuccessfully because of not verified
+	req, err = http.NewRequest(http.MethodGet, ts.URL+fmt.Sprintf("/api/v1/telegram/subscribe?site=remark42&tkn=%s", subscribeRequest.Token), http.NoBody)
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusNotFound, resp.StatusCode, string(body))
+	require.Equal(t, `{"code":0,"details":"request is not verified yet","error":"not verified"}`+"\n", string(body))
+
+	mockTlgrm.notVerified = false
+
+	// verify telegram, unsuccessfully because of unknown site
+	req, err = http.NewRequest(http.MethodGet, ts.URL+fmt.Sprintf("/api/v1/telegram/subscribe?site=remark42&tkn=%s", subscribeRequest.Token), http.NoBody)
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode, string(body))
+	require.Equal(t, `{"code":0,"details":"can't set telegram for user","error":"site \"unknown_site\" not found"}`+"\n", string(body))
+
+	mockTlgrm.site = "remark42"
+	// verify telegram, successfully
+	req, err = http.NewRequest(http.MethodGet, ts.URL+fmt.Sprintf("/api/v1/telegram/subscribe?site=remark42&tkn=%s", subscribeRequest.Token), http.NoBody)
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	var subscribeResult struct {
+		Address string `json:"address"`
+		Updated bool   `json:"updated"`
+	}
+	err = json.Unmarshal(body, &subscribeResult)
+	assert.NoError(t, err)
+	assert.True(t, subscribeResult.Updated)
+
+	// get user information to verify the subscription
+	req, err = http.NewRequest(http.MethodGet, ts.URL+"/api/v1/user?site=remark42", http.NoBody)
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	var user store.User
+	err = json.Unmarshal(body, &user)
+	assert.NoError(t, err)
+	assert.Equal(t, store.User{Name: "developer one", ID: "provider1_dev",
+		Picture: "http://example.com/pic.png", IP: "127.0.0.1", SiteID: "remark42"}, user)
+
+	// create child comment from another user, telegram notification expected
+	req, err = http.NewRequest("POST", ts.URL+"/api/v1/comment?site=remark42", strings.NewReader(fmt.Sprintf(
+		`{"text": "test 789",
+	"pid": %q,
+	"user": {"name": "other_user"},
+	"locator":{"url": "https://radio-t.com/blah1",
+	"site": "remark42"}}`, parentComment.ID)))
+	assert.NoError(t, err)
+	req.Header.Add("X-JWT", anonToken)
+	resp, err = client.Do(req)
+	assert.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusCreated, resp.StatusCode, string(body))
+	waitForCount(t, 3, func() int { return len(mockDestination.Get()) })
+	assert.Equal(t, []string{"good_telegram"}, mockDestination.Get()[2].Telegrams)
+
+	// delete user's telegram
+	req, err = http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/telegram?site=remark42", http.NoBody)
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+	// create child comment from another user, no telegram notification
+	req, err = http.NewRequest("POST", ts.URL+"/api/v1/comment?site=remark42", strings.NewReader(
+		`{"text": "test 321",
+	"user": {"name": "other_user"},
+	"locator":{"url": "https://radio-t.com/blah1",
+	"site": "remark42"}}`))
+	assert.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	resp, err = client.Do(req)
+	assert.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusCreated, resp.StatusCode, string(body))
+	waitForCountSettled(t, 4, func() int { return len(mockDestination.Get()) })
+	assert.Empty(t, mockDestination.Get()[3].Telegrams)
 }
 
 func TestRest_UserAllData(t *testing.T) {
@@ -760,7 +1427,7 @@ func TestRest_UserAllData(t *testing.T) {
 	defer teardown()
 
 	// write 3 comments
-	user := store.User{ID: "dev", Name: "user name 1"}
+	user := store.User{ID: "provider1_dev", Name: "user name 1"}
 	c1 := store.Comment{User: user, Text: "test test #1", Locator: store.Locator{SiteID: "remark42",
 		URL: "https://radio-t.com/blah1"}, Timestamp: time.Date(2018, 5, 27, 1, 14, 10, 0, time.Local)}
 	c2 := store.Comment{User: user, Text: "test test #2", ParentID: "p1", Locator: store.Locator{SiteID: "remark42",
@@ -774,23 +1441,25 @@ func TestRest_UserAllData(t *testing.T) {
 	_, err = srv.DataService.Create(c3)
 	require.NoError(t, err)
 
-	client := &http.Client{Timeout: 1 * time.Second}
-	req, err := http.NewRequest("GET", ts.URL+"/api/v1/userdata?site=remark42", nil)
+	client := &http.Client{Timeout: waitTimeout}
+	defer client.CloseIdleConnections()
+	req, err := http.NewRequest("GET", ts.URL+"/api/v1/userdata?site=remark42", http.NoBody)
 	require.NoError(t, err)
 	req.Header.Add("X-JWT", devToken)
 	resp, err := client.Do(req)
 	require.NoError(t, err)
-	require.Equal(t, 200, resp.StatusCode)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Equal(t, "application/gzip", resp.Header.Get("Content-Type"))
 
 	ungzReader, err := gzip.NewReader(resp.Body)
-	assert.NoError(t, err)
+	require.NoError(t, err)
+	defer ungzReader.Close()
 	require.NoError(t, resp.Body.Close())
-	ungzBody, err := ioutil.ReadAll(ungzReader)
-	assert.NoError(t, err)
+	ungzBody, err := io.ReadAll(ungzReader)
+	require.NoError(t, err)
 	strUungzBody := string(ungzBody)
 	assert.True(t, strings.HasPrefix(strUungzBody,
-		`{"info": {"name":"developer one","id":"dev","picture":"http://example.com/pic.png","ip":"127.0.0.1","admin":false,"site_id":"remark42"}, "comments":[{`))
+		`{"info": {"name":"developer one","id":"provider1_dev","picture":"http://example.com/pic.png","ip":"127.0.0.1","admin":false,"site_id":"remark42"}, "comments":[{`))
 	assert.Equal(t, 3, strings.Count(strUungzBody, `"text":`), "3 comments inside")
 
 	parsed := struct {
@@ -800,49 +1469,109 @@ func TestRest_UserAllData(t *testing.T) {
 
 	err = json.Unmarshal(ungzBody, &parsed)
 	assert.NoError(t, err)
-	assert.Equal(t, store.User{Name: "developer one", ID: "dev",
+	assert.Equal(t, store.User{Name: "developer one", ID: "provider1_dev",
 		Picture: "http://example.com/pic.png", IP: "127.0.0.1", SiteID: "remark42"}, parsed.Info)
 	assert.Equal(t, 3, len(parsed.Comments))
 
-	req, err = http.NewRequest("GET", ts.URL+"/api/v1/userdata?site=remark42", nil)
+	req, err = http.NewRequest("GET", ts.URL+"/api/v1/userdata?site=remark42", http.NoBody)
 	require.NoError(t, err)
 	resp, err = client.Do(req)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
-	require.Equal(t, 401, resp.StatusCode)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 }
 
 func TestRest_UserAllDataManyComments(t *testing.T) {
 	ts, srv, teardown := startupT(t)
 	defer teardown()
 
-	user := store.User{ID: "dev", Name: "user name 1"}
+	user := store.User{ID: "provider1_dev", Name: "user name 1"}
 	c := store.Comment{User: user, Text: "test test #1", Locator: store.Locator{SiteID: "remark42",
 		URL: "https://radio-t.com/blah1"}, Timestamp: time.Date(2018, 5, 27, 1, 14, 10, 0, time.Local)}
 
-	for i := 0; i < 51; i++ {
+	for i := range 51 {
 		c.ID = fmt.Sprintf("id-%03d", i)
 		c.Timestamp = c.Timestamp.Add(time.Second)
 		_, err := srv.DataService.Create(c)
 		require.NoError(t, err)
 	}
-	client := &http.Client{Timeout: 1 * time.Second}
-	req, err := http.NewRequest("GET", ts.URL+"/api/v1/userdata?site=remark42", nil)
+	client := &http.Client{Timeout: waitTimeout}
+	defer client.CloseIdleConnections()
+	req, err := http.NewRequest("GET", ts.URL+"/api/v1/userdata?site=remark42", http.NoBody)
 	require.NoError(t, err)
 	req.Header.Add("X-JWT", devToken)
 	resp, err := client.Do(req)
 	require.NoError(t, err)
-	require.Equal(t, 200, resp.StatusCode)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Equal(t, "application/gzip", resp.Header.Get("Content-Type"))
 
 	ungzReader, err := gzip.NewReader(resp.Body)
 	assert.NoError(t, err)
-	ungzBody, err := ioutil.ReadAll(ungzReader)
+	defer ungzReader.Close()
+	assert.NoError(t, resp.Body.Close())
+	ungzBody, err := io.ReadAll(ungzReader)
 	assert.NoError(t, err)
 	strUngzBody := string(ungzBody)
 	assert.True(t, strings.HasPrefix(strUngzBody,
-		`{"info": {"name":"developer one","id":"dev","picture":"http://example.com/pic.png","ip":"127.0.0.1","admin":false,"site_id":"remark42"}, "comments":[{`))
+		`{"info": {"name":"developer one","id":"provider1_dev","picture":"http://example.com/pic.png","ip":"127.0.0.1","admin":false,"site_id":"remark42"}, "comments":[{`))
 	assert.Equal(t, 51, strings.Count(strUngzBody, `"text":`), "51 comments inside")
+}
+
+func TestRest_UserAllDataPageBoundaries(t *testing.T) {
+	for _, n := range []int{100, 101, 250} {
+		t.Run(fmt.Sprintf("%d comments", n), func(t *testing.T) {
+			ts, srv, teardown := startupT(t)
+			defer teardown()
+
+			user := store.User{ID: "provider1_dev", Name: "user name 1"}
+			c := store.Comment{User: user, Text: "test", Locator: store.Locator{SiteID: "remark42",
+				URL: "https://radio-t.com/blah1"}, Timestamp: time.Date(2018, 5, 27, 1, 14, 10, 0, time.UTC)}
+			for i := range n {
+				c.ID = fmt.Sprintf("id-%03d", i)
+				c.Timestamp = c.Timestamp.Add(time.Second)
+				_, err := srv.DataService.Create(c)
+				require.NoError(t, err)
+			}
+
+			parsed := getUserAllData(t, ts.URL)
+			assert.Equal(t, n, len(parsed.Comments), "every comment is exported in one JSON array")
+		})
+	}
+}
+
+func TestRest_UserAllDataNoComments(t *testing.T) {
+	ts, _, teardown := startupT(t)
+	defer teardown()
+
+	parsed := getUserAllData(t, ts.URL)
+	assert.Equal(t, "provider1_dev", parsed.Info.ID)
+	assert.Empty(t, parsed.Comments)
+}
+
+// getUserAllData requests /userdata as the dev user and decodes the gzipped JSON export
+func getUserAllData(t *testing.T, url string) (res struct {
+	Info     store.User      `json:"info"`
+	Comments []store.Comment `json:"comments"`
+}) {
+	t.Helper()
+	client := &http.Client{Timeout: waitTimeout}
+	defer client.CloseIdleConnections()
+	req, err := http.NewRequest("GET", url+"/api/v1/userdata?site=remark42", http.NoBody)
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "application/gzip", resp.Header.Get("Content-Type"))
+
+	ungzReader, err := gzip.NewReader(resp.Body)
+	require.NoError(t, err)
+	defer ungzReader.Close()
+	body, err := io.ReadAll(ungzReader)
+	require.NoError(t, err, "gzip body decodes")
+	require.NoError(t, json.Unmarshal(body, &res), "export is valid JSON")
+	return res
 }
 
 func TestRest_DeleteMe(t *testing.T) {
@@ -850,13 +1579,14 @@ func TestRest_DeleteMe(t *testing.T) {
 	defer teardown()
 
 	client := http.Client{}
-	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/deleteme?site=remark42", ts.URL), nil)
+	defer client.CloseIdleConnections()
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/deleteme?site=remark42", ts.URL), http.NoBody)
 	assert.NoError(t, err)
 	req.Header.Add("X-JWT", devToken)
 	resp, err := client.Do(req)
 	assert.NoError(t, err)
-	assert.Equal(t, 200, resp.StatusCode)
-	body, err := ioutil.ReadAll(resp.Body)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
 	assert.NoError(t, resp.Body.Close())
 	assert.NoError(t, err)
 
@@ -864,19 +1594,21 @@ func TestRest_DeleteMe(t *testing.T) {
 	err = json.Unmarshal(body, &m)
 	assert.NoError(t, err)
 	assert.Equal(t, "remark42", m["site"])
-	assert.Equal(t, "dev", m["user_id"])
+	assert.Equal(t, "provider1_dev", m["user_id"])
 
 	tkn := m["token"]
 	claims, err := srv.Authenticator.TokenService().Parse(tkn)
 	assert.NoError(t, err)
-	assert.Equal(t, "dev", claims.User.ID)
-	assert.Equal(t, "https://demo.remark42.com/web/deleteme.html?token="+tkn, m["link"])
+	assert.Equal(t, "provider1_dev", claims.User.ID)
+	assert.Equal(t, "http://example.com/pic.png", claims.User.Picture,
+		"delete_me token must carry the user's picture so the avatar can be removed when the request is processed")
+	assert.Equal(t, "https://demo.remark42.com/web/deleteme.html?site_id=remark42&token="+tkn, m["link"])
 
-	req, err = http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/deleteme?site=remark42", ts.URL), nil)
+	req, err = http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/deleteme?site=remark42", ts.URL), http.NoBody)
 	assert.NoError(t, err)
 	resp, err = client.Do(req)
 	assert.NoError(t, err)
-	assert.Equal(t, 401, resp.StatusCode)
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	assert.NoError(t, resp.Body.Close())
 }
 
@@ -896,14 +1628,15 @@ func TestRest_SavePictureCtrl(t *testing.T) {
 		require.NoError(t, bodyWriter.Close())
 
 		client := http.Client{}
-		req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/picture", ts.URL), bodyBuf)
+		defer client.CloseIdleConnections()
+		req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/picture?site=remark42", ts.URL), bodyBuf)
 		require.NoError(t, err)
 		req.Header.Add("Content-Type", contentType)
 		req.Header.Add("X-JWT", devToken)
 		resp, err := client.Do(req)
 		assert.NoError(t, err)
-		assert.Equal(t, 200, resp.StatusCode)
-		body, err := ioutil.ReadAll(resp.Body)
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.NoError(t, resp.Body.Close())
 
@@ -917,8 +1650,8 @@ func TestRest_SavePictureCtrl(t *testing.T) {
 	id := savePic("picture.png")
 	resp, err := http.Get(fmt.Sprintf("%s/api/v1/picture/%s", ts.URL, id))
 	require.NoError(t, err)
-	assert.Equal(t, 200, resp.StatusCode)
-	body, err := ioutil.ReadAll(resp.Body)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	assert.Equal(t, 1462, len(body))
@@ -928,34 +1661,34 @@ func TestRest_SavePictureCtrl(t *testing.T) {
 	resp, err = http.Get(fmt.Sprintf("%s/api/v1/picture/%s", ts.URL, id))
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
-	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, "image/png", resp.Header.Get("Content-Type"))
 
 	id = savePic("picture.jpg")
 	resp, err = http.Get(fmt.Sprintf("%s/api/v1/picture/%s", ts.URL, id))
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
-	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, "image/png", resp.Header.Get("Content-Type"))
 
 	id = savePic("picture.blah")
 	resp, err = http.Get(fmt.Sprintf("%s/api/v1/picture/%s", ts.URL, id))
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
-	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, "image/png", resp.Header.Get("Content-Type"))
 
 	resp, err = http.Get(fmt.Sprintf("%s/api/v1/picture/blah/pic.blah", ts.URL))
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
-	assert.Equal(t, 400, resp.StatusCode)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
 func TestRest_CreateWithPictures(t *testing.T) {
 	ts, svc, teardown := startupT(t)
 	defer func() {
 		teardown()
-		os.RemoveAll("/tmp/remark42")
+		assert.NoError(t, os.RemoveAll("/tmp/remark42"))
 	}()
 	lgr.Setup(lgr.Debug, lgr.CallerFile, lgr.CallerFunc)
 
@@ -963,8 +1696,12 @@ func TestRest_CreateWithPictures(t *testing.T) {
 		Staging:  "/tmp/remark42/images.staging",
 		Location: "/tmp/remark42/images",
 	}, image.ServiceParams{
-		EditDuration: 100 * time.Millisecond,
+		// the "not moved yet" checks below run right after the comment POST returns, so the
+		// commit window has to be wide enough that a stalled runner cannot close it first
+		EditDuration: 3 * time.Second,
 		MaxSize:      2000,
+		ImageAPI:     svc.RemarkURL + "/api/v1/picture/",
+		ProxyAPI:     svc.RemarkURL + "/api/v1/img",
 	})
 	defer imageService.Close(context.Background())
 
@@ -985,16 +1722,18 @@ func TestRest_CreateWithPictures(t *testing.T) {
 		contentType := bodyWriter.FormDataContentType()
 		require.NoError(t, bodyWriter.Close())
 		client := http.Client{}
-		req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/picture", ts.URL), bodyBuf)
+		defer client.CloseIdleConnections()
+		req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/picture?site=remark42", ts.URL), bodyBuf)
 		require.NoError(t, err)
 		req.Header.Add("Content-Type", contentType)
 		req.Header.Add("X-JWT", devToken)
 		resp, err := client.Do(req)
 		assert.NoError(t, err)
-		assert.Equal(t, 200, resp.StatusCode)
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
 
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
+		assert.NoError(t, resp.Body.Close())
 		m := map[string]string{}
 		err = json.Unmarshal(body, &m)
 		assert.NoError(t, err)
@@ -1007,13 +1746,14 @@ func TestRest_CreateWithPictures(t *testing.T) {
 		ids[i] = uploadPicture(fmt.Sprintf("pic%d.png", i))
 	}
 
-	text := fmt.Sprintf(`text 123  ![](/api/v1/picture/%s) *xxx* ![](/api/v1/picture/%s) ![](/api/v1/picture/%s)`, ids[0], ids[1], ids[2])
-	body := fmt.Sprintf(`{"text": "%s", "locator":{"url": "https://radio-t.com/blah1", "site": "remark42"}}`, text)
+	text := fmt.Sprintf(`text 123  ![](%s/api/v1/picture/%s) *xxx* ![](%s/api/v1/picture/%s) ![](%s/api/v1/picture/%s)`, svc.RemarkURL, ids[0], svc.RemarkURL, ids[1], svc.RemarkURL, ids[2])
+	body := fmt.Sprintf(`{"text": %q, "locator":{"url": "https://radio-t.com/blah1", "site": "remark42"}}`, text)
 
-	resp, err := post(t, ts.URL+"/api/v1/comment", body)
+	resp, err := post(t, ts.URL+"/api/v1/comment?site=remark42", body)
 	assert.NoError(t, err)
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	assert.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
 	require.Equal(t, http.StatusCreated, resp.StatusCode, string(b))
 
 	for i := range ids {
@@ -1021,10 +1761,341 @@ func TestRest_CreateWithPictures(t *testing.T) {
 		assert.Error(t, err, "picture %d not moved from staging yet", i)
 	}
 
-	time.Sleep(1500 * time.Millisecond)
-
+	// the commit runs once EditDuration expires
 	for i := range ids {
-		_, err = os.Stat("/tmp/remark42/images/" + ids[i])
-		assert.NoError(t, err, "picture %d moved from staging and available in permanent location", i)
+		require.Eventually(t, func() bool {
+			_, e := os.Stat("/tmp/remark42/images/" + ids[i])
+			return e == nil
+		}, waitTimeout, pollInterval, "picture %d moved from staging and available in permanent location", i)
+	}
+}
+
+type mockTelegram struct {
+	notVerified bool
+	site        string
+}
+
+func (m *mockTelegram) AddToken(string, string, string, time.Time) {}
+
+func (m *mockTelegram) GetBotUsername() string {
+	return "botUsername"
+}
+
+func (m *mockTelegram) CheckToken(string, string) (telegram, site string, err error) {
+	if m.notVerified {
+		return "", "", fmt.Errorf("not verified")
+	}
+	return "good_telegram", m.site, nil
+}
+
+func TestExtractIP(t *testing.T) {
+	tbl := []struct {
+		addr string
+		exp  string
+	}{
+		{"127.0.0.1:8080", "127.0.0.1"},
+		{"127.0.0.1", "127.0.0.1"},
+		{"192.168.1.1:443", "192.168.1.1"},
+		{"[::1]:8080", "::1"},
+		{"::1", "::1"},
+		{"[2001:db8::1]:8080", "2001:db8::1"},
+		{"2001:db8::1", "2001:db8::1"},
+		{"[fe80::1%25eth0]:80", "fe80::1%25eth0"},
+		{"", ""},
+	}
+
+	for _, tt := range tbl {
+		t.Run(tt.addr, func(t *testing.T) {
+			assert.Equal(t, tt.exp, extractIP(tt.addr))
+		})
+	}
+}
+
+// a token without a handshake, such as the login token, used as a confirmation token is rejected as invalid,
+// not dereferenced
+func TestRest_EmailTokensWithoutHandshake(t *testing.T) {
+	ts, srv, teardown := startupT(t)
+	defer teardown()
+
+	otherUserTkn, err := srv.Authenticator.TokenService().Token(token.Claims{
+		Handshake: &token.Handshake{ID: "someone_else::good@example.com"},
+		Audience:  jwt.ClaimStrings{"remark42"},
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(10 * time.Minute)),
+		NotBefore: jwt.NewNumericDate(time.Now().Add(-1 * time.Minute)),
+		Issuer:    "remark42",
+	})
+	require.NoError(t, err)
+
+	tbl := []struct {
+		name, method, url, body string
+		code                    int
+	}{
+		{name: "confirm with a login token", method: http.MethodPost, url: "/api/v1/email/confirm?site=remark42",
+			body: fmt.Sprintf(`{"site":"remark42","token":%q}`, devToken), code: http.StatusBadRequest},
+		{name: "confirm with another user's handshake", method: http.MethodPost, url: "/api/v1/email/confirm?site=remark42",
+			body: fmt.Sprintf(`{"site":"remark42","token":%q}`, otherUserTkn), code: http.StatusBadRequest},
+		{name: "unsubscribe with a login token", method: http.MethodGet, url: "/email/unsubscribe.html?site=remark42&tkn=" + devToken,
+			code: http.StatusBadRequest},
+	}
+	client := http.Client{}
+	defer client.CloseIdleConnections()
+	for _, tt := range tbl {
+		t.Run(tt.name, func(t *testing.T) {
+			var body io.Reader = http.NoBody
+			if tt.body != "" {
+				body = strings.NewReader(tt.body)
+			}
+			req, err := http.NewRequest(tt.method, ts.URL+tt.url, body)
+			require.NoError(t, err)
+			req.Header.Add("X-JWT", devToken)
+			resp, err := client.Do(req)
+			require.NoError(t, err)
+			b, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			assert.Equal(t, tt.code, resp.StatusCode, string(b))
+		})
+	}
+}
+
+// subscribe and confirm act on the site matchSiteID verified in the query, not on a different site named in the body
+func TestRest_EmailSubscribeUsesVerifiedSite(t *testing.T) {
+	ts, srv, teardown := startupT(t, func(srv *Rest) {
+		require.NoError(t, srv.DataService.Engine.Close())
+		dir := t.TempDir()
+		b, err := engine.NewBoltDB(bolt.Options{},
+			engine.BoltSite{FileName: filepath.Join(dir, "remark42.db"), SiteID: "remark42"},
+			engine.BoltSite{FileName: filepath.Join(dir, "other.db"), SiteID: "other"})
+		require.NoError(t, err)
+		srv.DataService.Engine = b
+	})
+	defer teardown()
+
+	tkn, err := srv.Authenticator.TokenService().Token(token.Claims{
+		Handshake: &token.Handshake{ID: "provider1_dev::good@example.com"},
+		Audience:  jwt.ClaimStrings{"remark42"},
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(10 * time.Minute)),
+		NotBefore: jwt.NewNumericDate(time.Now().Add(-1 * time.Minute)),
+		Issuer:    "remark42",
+	})
+	require.NoError(t, err)
+
+	client := http.Client{}
+	defer client.CloseIdleConnections()
+	send := func(url, body string) int {
+		req, reqErr := http.NewRequest(http.MethodPost, ts.URL+url, strings.NewReader(body))
+		require.NoError(t, reqErr)
+		req.Header.Add("X-JWT", devToken)
+		resp, reqErr := client.Do(req)
+		require.NoError(t, reqErr)
+		require.NoError(t, resp.Body.Close())
+		return resp.StatusCode
+	}
+
+	// the session belongs to remark42; the body names the other site.
+	// The address is already confirmed on the verified site, so subscribing to it again conflicts
+	_, err = srv.DataService.SetUserEmail("remark42", "provider1_dev", "good@example.com")
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusConflict, send("/api/v1/email/subscribe?site=remark42", `{"site":"other","address":"good@example.com"}`),
+		"subscribe checks the verified site")
+	require.NoError(t, srv.DataService.DeleteUserDetail("remark42", "provider1_dev", engine.UserEmail))
+
+	assert.Equal(t, http.StatusOK, send("/api/v1/email/confirm?site=remark42", fmt.Sprintf(`{"site":"other","token":%q}`, tkn)))
+	email, err := srv.DataService.GetUserEmail("remark42", "provider1_dev")
+	require.NoError(t, err)
+	assert.Equal(t, "good@example.com", email, "email set on the verified site")
+	email, err = srv.DataService.GetUserEmail("other", "provider1_dev")
+	require.NoError(t, err)
+	assert.Empty(t, email, "email not set on the site named only in the body")
+}
+
+// the admin password sent along with a token that has no user, such as a confirmation token, passes
+// authentication; setting and deleting the email then has no token user to update, which is not a panic
+func TestRest_EmailWithAdminPasswordAndTokenWithoutUser(t *testing.T) {
+	ts, srv, teardown := startupT(t)
+	defer teardown()
+
+	tkn, err := srv.Authenticator.TokenService().Token(token.Claims{
+		Handshake: &token.Handshake{ID: "admin::admin@example.com"},
+		Audience:  jwt.ClaimStrings{"remark42"},
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(10 * time.Minute)),
+		NotBefore: jwt.NewNumericDate(time.Now().Add(-1 * time.Minute)),
+		Issuer:    "remark42",
+	})
+	require.NoError(t, err)
+
+	client := http.Client{}
+	defer client.CloseIdleConnections()
+	send := func(method, url, body string) (int, string) {
+		var reqBody io.Reader = http.NoBody
+		if body != "" {
+			reqBody = strings.NewReader(body)
+		}
+		req, reqErr := http.NewRequest(method, ts.URL+url, reqBody)
+		require.NoError(t, reqErr)
+		req.SetBasicAuth("admin", "password")
+		req.Header.Add("X-JWT", tkn)
+		resp, reqErr := client.Do(req)
+		require.NoError(t, reqErr)
+		b, reqErr := io.ReadAll(resp.Body)
+		require.NoError(t, reqErr)
+		require.NoError(t, resp.Body.Close())
+		return resp.StatusCode, string(b)
+	}
+
+	code, body := send(http.MethodPost, "/api/v1/email/confirm?site=remark42", fmt.Sprintf(`{"site":"remark42","token":%q}`, tkn))
+	assert.Equal(t, http.StatusOK, code, body)
+	email, err := srv.DataService.GetUserEmail("remark42", "admin")
+	require.NoError(t, err)
+	assert.Equal(t, "admin@example.com", email)
+
+	code, body = send(http.MethodDelete, "/api/v1/email?site=remark42", "")
+	assert.Equal(t, http.StatusOK, code, body)
+	email, err = srv.DataService.GetUserEmail("remark42", "admin")
+	require.NoError(t, err)
+	assert.Empty(t, email)
+}
+
+// a malformed handshake carries the address, which stays out of the error sent back and logged
+func TestRest_EmailMalformedHandshakeHidesAddress(t *testing.T) {
+	ts, srv, teardown := startupT(t)
+	defer teardown()
+
+	tkn, err := srv.Authenticator.TokenService().Token(token.Claims{
+		Handshake: &token.Handshake{ID: "provider1_dev::secret@example.com::extra"},
+		Audience:  jwt.ClaimStrings{"remark42"},
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(10 * time.Minute)),
+		NotBefore: jwt.NewNumericDate(time.Now().Add(-1 * time.Minute)),
+		Issuer:    "remark42",
+	})
+	require.NoError(t, err)
+
+	client := http.Client{}
+	defer client.CloseIdleConnections()
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/email/confirm?site=remark42",
+		strings.NewReader(fmt.Sprintf(`{"site":"remark42","token":%q}`, tkn)))
+	require.NoError(t, err)
+	req.Header.Add("X-JWT", devToken)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	b, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, string(b))
+	assert.NotContains(t, string(b), "secret@example.com", "confirm error echoes the address")
+
+	body, code := get(t, ts.URL+"/email/unsubscribe.html?site=remark42&tkn="+tkn)
+	assert.Equal(t, http.StatusBadRequest, code, body)
+	assert.NotContains(t, body, "secret@example.com", "unsubscribe error echoes the address")
+}
+
+// a handshake with an empty user or address is rejected, not acted on with the empty part
+func TestRest_EmailHandshakeWithEmptyPart(t *testing.T) {
+	ts, srv, teardown := startupT(t)
+	defer teardown()
+
+	for _, hs := range []string{"provider1_dev::", "::good@example.com"} {
+		t.Run(hs, func(t *testing.T) {
+			tkn, err := srv.Authenticator.TokenService().Token(token.Claims{
+				Handshake: &token.Handshake{ID: hs},
+				Audience:  jwt.ClaimStrings{"remark42"},
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(10 * time.Minute)),
+				NotBefore: jwt.NewNumericDate(time.Now().Add(-1 * time.Minute)),
+				Issuer:    "remark42",
+			})
+			require.NoError(t, err)
+
+			client := http.Client{}
+			defer client.CloseIdleConnections()
+			req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/email/confirm?site=remark42",
+				strings.NewReader(fmt.Sprintf(`{"site":"remark42","token":%q}`, tkn)))
+			require.NoError(t, err)
+			req.Header.Add("X-JWT", devToken)
+			resp, err := client.Do(req)
+			require.NoError(t, err)
+			b, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "confirm rejects the handshake: %s", string(b))
+
+			body, code := get(t, ts.URL+"/email/unsubscribe.html?site=remark42&tkn="+tkn)
+			assert.Equal(t, http.StatusBadRequest, code, "unsubscribe rejects the handshake: %s", body)
+		})
+	}
+}
+
+// subscribedUserToken stores an email for provider1_dev and returns the token of its unsubscribe link
+func subscribedUserToken(t *testing.T, srv *Rest) string {
+	t.Helper()
+	_, err := srv.DataService.SetUserEmail("remark42", "provider1_dev", "good@example.com")
+	require.NoError(t, err)
+	tkn, err := srv.Authenticator.TokenService().Token(token.Claims{
+		Handshake: &token.Handshake{ID: "provider1_dev::good@example.com"},
+		Audience:  jwt.ClaimStrings{"remark42"},
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(10 * time.Minute)),
+		NotBefore: jwt.NewNumericDate(time.Now().Add(-1 * time.Minute)),
+		Issuer:    "remark42",
+	})
+	require.NoError(t, err)
+	return tkn
+}
+
+// a template on disk takes precedence over the embedded one; when it is broken, the html pages
+// fail with a plain 500 instead of a half-rendered page
+func TestRest_EmailUnsubscribeBrokenTemplate(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"error_response.html.tmpl", "email_unsubscribe.html.tmpl"} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("{{ .Broken"), 0o600))
+	}
+	t.Chdir(dir)
+
+	ts, srv, teardown := startupT(t)
+	defer teardown()
+	tkn := subscribedUserToken(t, srv)
+
+	for name, url := range map[string]string{
+		"error page":       "/email/unsubscribe.html?site=remark42",
+		"unsubscribe page": "/email/unsubscribe.html?site=remark42&tkn=" + tkn,
+	} {
+		t.Run(name, func(t *testing.T) {
+			body, code := get(t, ts.URL+url)
+			assert.Equal(t, http.StatusInternalServerError, code)
+			assert.Equal(t, "Internal Server Error\n", body)
+		})
+	}
+	email, err := srv.DataService.GetUserEmail("remark42", "provider1_dev")
+	require.NoError(t, err)
+	assert.Empty(t, email, "the unsubscribe itself went through before the page failed")
+}
+
+// a template on disk may wrap its content in {{define "error"}} or {{define "unsubscribe"}}, the names
+// the pages are executed under, and still renders
+func TestRest_EmailUnsubscribeNamedTemplateOverride(t *testing.T) {
+	dir := t.TempDir()
+	for name, content := range map[string]string{
+		"error_response.html.tmpl":    `{{define "error"}}custom error page: {{.Error}}{{end}}`,
+		"email_unsubscribe.html.tmpl": `{{define "unsubscribe"}}custom unsubscribe page{{end}}`,
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600))
+	}
+	t.Chdir(dir)
+
+	ts, srv, teardown := startupT(t)
+	defer teardown()
+	tkn := subscribedUserToken(t, srv)
+
+	for name, tc := range map[string]struct {
+		url  string
+		code int
+		body string
+	}{
+		"error page":       {url: "/email/unsubscribe.html?site=remark42", code: http.StatusBadRequest, body: "custom error page: "},
+		"unsubscribe page": {url: "/email/unsubscribe.html?site=remark42&tkn=" + tkn, code: http.StatusOK, body: "custom unsubscribe page"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			body, code := get(t, ts.URL+tc.url)
+			assert.Equal(t, tc.code, code)
+			assert.True(t, strings.HasPrefix(body, tc.body), "the override's defined template renders: %q", body)
+		})
 	}
 }

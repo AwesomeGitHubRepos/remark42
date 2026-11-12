@@ -9,7 +9,6 @@ import (
 )
 
 func TestComment_Sanitize(t *testing.T) {
-
 	tbl := []struct {
 		inp Comment
 		out Comment
@@ -23,7 +22,7 @@ func TestComment_Sanitize(t *testing.T) {
 			},
 			out: Comment{
 				Text: "blah XSS\n\t",
-				User: User{ID: `&lt;a href=&#34;http://blah.com&#34;&gt;username&lt;/a&gt;`, Name: "name &lt;b/&gt;"},
+				User: User{ID: `&lt;a href=&#34;http://blah.com&#34;&gt;username&lt;/a&gt;`, Name: "name"},
 			},
 		},
 		{
@@ -37,6 +36,10 @@ func TestComment_Sanitize(t *testing.T) {
 			},
 		},
 		{
+			inp: Comment{Text: "blah `123`"},
+			out: Comment{Text: "blah `123`"},
+		},
+		{
 			inp: Comment{Text: "blah & & 123 &mdash; &mdash;"},
 			out: Comment{Text: `blah &amp; &amp; 123 — —`},
 		},
@@ -45,8 +48,16 @@ func TestComment_Sanitize(t *testing.T) {
 			out: Comment{Text: `blah &amp; &amp; 123 — —`},
 		},
 		{
+			inp: Comment{Text: "blah `123`", User: User{Name: "name \"xxx\" `yyy`"}},
+			out: Comment{Text: "blah `123`", User: User{Name: "name \"xxx\" `yyy`"}},
+		},
+		{
 			inp: Comment{Text: "blah & & 123", User: User{Name: "name <> & ' ` \""}},
-			out: Comment{Text: `blah &amp; &amp; 123`, User: User{Name: "name &lt;&gt; & ' ` \""}},
+			out: Comment{Text: `blah &amp; &amp; 123`, User: User{Name: "name &lt;&gt; &amp; ' ` \""}},
+		},
+		{
+			inp: Comment{Text: "blah & & 123", User: User{Name: `name <a href="javascript:alert('XSS1')" onmouseover="alert('XSS2')">XSS</a>`}},
+			out: Comment{Text: `blah &amp; &amp; 123`, User: User{Name: "name XSS"}},
 		},
 
 		{
@@ -73,26 +84,46 @@ func TestComment_Sanitize(t *testing.T) {
 			out: Comment{Text: "&lt;img src=x onerror=alert(1)&gt;",
 				Locator: Locator{URL: "/p/2021/03/23/prep-747/#remark42__comment-1b365913-7056-4920-b9ad-01304bdda085"}},
 		},
+		{
+			inp: Comment{Text: "blah blah", PostTitle: "<script>alert()</script>something"},
+			out: Comment{Text: "blah blah", PostTitle: "something"},
+		},
+		{
+			inp: Comment{Text: "blah blah", PostTitle: "<a href=\"https://example.com\">test</a>"},
+			out: Comment{Text: "blah blah", PostTitle: "test"},
+		},
+		{
+			inp: Comment{Text: "blah blah", PostTitle: "https://example.com/blah"}, // link is left as-is, but not rendered as <a>
+			out: Comment{Text: "blah blah", PostTitle: "https://example.com/blah"},
+		},
+		{
+			inp: Comment{Text: `<blockquote class="twitter-tweet"><p lang="es" dir="ltr">Silicon iMac Concept<a href="https://t.co/7ga95QxVXn">https://t.co/7ga95QxVXn</a> by <a href="https://twitter.com/marcsheep?ref_src=twsrc%5Etfw">@marcsheep</a> <a href="https://t.co/ULnVpG8w55">pic.twitter.com/ULnVpG8w55</a></p>&mdash; Andreas Storm (@avstorm) <a href="https://twitter.com/avstorm/status/1325693387798933504?ref_src=twsrc%5Etfw">November 9, 2020</a></blockquote> <script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>`, PostTitle: "Twitter quote"},
+			out: Comment{Text: `<blockquote class="twitter-tweet"><p lang="es" dir="ltr">Silicon iMac Concept<a href="https://t.co/7ga95QxVXn" rel="nofollow">https://t.co/7ga95QxVXn</a> by <a href="https://twitter.com/marcsheep?ref_src=twsrc%5Etfw" rel="nofollow">@marcsheep</a> <a href="https://t.co/ULnVpG8w55" rel="nofollow">pic.twitter.com/ULnVpG8w55</a></p>— Andreas Storm (@avstorm) <a href="https://twitter.com/avstorm/status/1325693387798933504?ref_src=twsrc%5Etfw" rel="nofollow">November 9, 2020</a></blockquote> `, PostTitle: "Twitter quote"},
+		},
 	}
 
 	for n, tt := range tbl {
-		tt.inp.Sanitize()
-		assert.Equal(t, tt.out, tt.inp, "check #%d", n)
+		t.Run(strconv.Itoa(n), func(t *testing.T) {
+			tt.inp.Sanitize()
+			assert.Equal(t, tt.out, tt.inp, "check #%d", n)
+		})
 	}
 }
 
 func TestComment_PrepareUntrusted(t *testing.T) {
 	comment := Comment{
-		Text:      `blah`,
-		User:      User{ID: "username"},
-		ParentID:  "p123",
-		ID:        "123",
-		Locator:   Locator{SiteID: "site", URL: "url"},
-		Score:     10,
-		Pin:       true,
-		Deleted:   true,
-		Timestamp: time.Date(2018, 1, 1, 9, 30, 0, 0, time.Local),
-		Votes:     map[string]bool{"uu": true},
+		Text:        `blah`,
+		User:        User{ID: "username"},
+		ParentID:    "p123",
+		ID:          "123",
+		Locator:     Locator{SiteID: "site", URL: "url"},
+		Score:       10,
+		Pin:         true,
+		Deleted:     true,
+		Timestamp:   time.Date(2018, 1, 1, 9, 30, 0, 0, time.UTC),
+		Votes:       map[string]bool{"uu": true},
+		Controversy: 123,
+		Imported:    true,
 	}
 
 	comment.PrepareUntrusted()
@@ -106,7 +137,8 @@ func TestComment_PrepareUntrusted(t *testing.T) {
 	assert.Equal(t, make(map[string]bool), comment.Votes)
 	assert.Equal(t, make(map[string]VotedIPInfo), comment.VotedIPs)
 	assert.Equal(t, User{ID: "username"}, comment.User)
-
+	assert.Equal(t, 0., comment.Controversy)
+	assert.Equal(t, false, comment.Imported)
 }
 
 func TestComment_SetDeleted(t *testing.T) {
@@ -118,7 +150,7 @@ func TestComment_SetDeleted(t *testing.T) {
 		Locator:   Locator{SiteID: "site", URL: "url"},
 		Score:     10,
 		Deleted:   false,
-		Timestamp: time.Date(2018, 1, 1, 9, 30, 0, 0, time.Local),
+		Timestamp: time.Date(2018, 1, 1, 9, 30, 0, 0, time.UTC),
 		Votes:     map[string]bool{"uu": true},
 		Pin:       true,
 	}
@@ -145,7 +177,7 @@ func TestComment_SetDeletedHard(t *testing.T) {
 		Locator:   Locator{SiteID: "site", URL: "url"},
 		Score:     10,
 		Deleted:   false,
-		Timestamp: time.Date(2018, 1, 1, 9, 30, 0, 0, time.Local),
+		Timestamp: time.Date(2018, 1, 1, 9, 30, 0, 0, time.UTC),
 		Votes:     map[string]bool{"uu": true},
 		Pin:       true,
 	}
@@ -172,12 +204,11 @@ func TestComment_Snippet(t *testing.T) {
 		{0, "", ""},
 		{-1, "test\nblah", "test blah"},
 		{5, "test\nblah", "test ..."},
-		{5, "xyz12345 xxx", "xyz12345 ..."},
-		{10, "xyz12345 xxx\ntest 123456", "xyz12345 xxx test ..."},
+		{5, "xyz12345 xxx", "xyz12..."},
+		{10, "xyz12345 xxx\ntest 123456", "xyz12345 ..."},
 	}
 
 	for i, tt := range tbl {
-		tt := tt
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
 			c := Comment{Text: tt.inp}
 			out := c.Snippet(tt.limit)
@@ -187,7 +218,6 @@ func TestComment_Snippet(t *testing.T) {
 }
 
 func TestComment_sanitizeAsURL(t *testing.T) {
-
 	tbl := []struct {
 		inp, out string
 	}{
@@ -214,11 +244,39 @@ func TestComment_sanitizeAsURL(t *testing.T) {
 	}
 
 	for i, tt := range tbl {
-		tt := tt
 		c := Comment{}
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
 			assert.Equal(t, tt.out, c.SanitizeAsURL(tt.inp))
 		})
 	}
+}
 
+func TestComment_sanitizeText(t *testing.T) {
+	tbl := []struct {
+		inp, out string
+	}{
+		{
+			"/p/2021/03/23/prep-747/#remark42__comment-1b365913-7056-4920-b9ad-01304bdda085",
+			"/p/2021/03/23/prep-747/#remark42__comment-1b365913-7056-4920-b9ad-01304bdda085",
+		},
+		{
+			"https://radio-t.com/p/2021/03/23/prep-747/#remark42__comment-1b365913-7056-4920-b9ad-01304bdda085",
+			"https://radio-t.com/p/2021/03/23/prep-747/#remark42__comment-1b365913-7056-4920-b9ad-01304bdda085",
+		},
+		{
+			"<script>alert()</script>something",
+			"something",
+		},
+		{
+			"<a href=javascript:alert(document.domain)//>xxx</a>",
+			"xxx",
+		},
+	}
+
+	for i, tt := range tbl {
+		c := Comment{}
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			assert.Equal(t, tt.out, c.SanitizeText(tt.inp))
+		})
+	}
 }

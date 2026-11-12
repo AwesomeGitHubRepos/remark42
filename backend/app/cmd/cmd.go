@@ -4,8 +4,11 @@ package cmd
 
 import (
 	"bytes"
-	"io/ioutil"
+	"context"
+	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +16,6 @@ import (
 	"time"
 
 	log "github.com/go-pkgz/lgr"
-	"github.com/pkg/errors"
 )
 
 // CommonOptionsCommander extends flags.Commander with SetCommon
@@ -31,11 +33,20 @@ type CommonOpts struct {
 	Revision     string
 }
 
+// SupportCmdOpts is set of commands shared among similar commands like backup/restore and such.
+// Order of fields defines the help command output order.
+type SupportCmdOpts struct {
+	Site        string        `short:"s" long:"site" env:"SITE" default:"remark" description:"site name"`
+	AdminPasswd string        `long:"admin-passwd" env:"ADMIN_PASSWD" default:"" description:"admin basic auth password"`
+	Timeout     time.Duration `long:"timeout" default:"60m" description:"timeout for the command run"`
+}
+
 // DeprecatedFlag contains information about deprecated option
 type DeprecatedFlag struct {
-	Old           string
-	New           string
-	RemoveVersion string
+	Old       string
+	New       string
+	Version   string
+	Collision bool
 }
 
 // SetCommon satisfies CommonOptionsCommander interface and sets common option fields
@@ -58,7 +69,6 @@ type fileParser struct {
 
 // parse apply template and also concat path and file. In case if file contains path separator path will be ignored
 func (p *fileParser) parse(now time.Time) (string, error) {
-
 	// file/location parameters my have template masks
 	fileTemplate := struct {
 		YYYYMMDD string
@@ -87,7 +97,7 @@ func (p *fileParser) parse(now time.Time) (string, error) {
 	}
 
 	if err := template.Must(template.New("bb").Parse(fname)).Execute(&bb, fileTemplate); err != nil {
-		return "", errors.Wrapf(err, "failed to parse %q", fname)
+		return "", fmt.Errorf("failed to parse %q: %w", fname, err)
 	}
 	return bb.String(), nil
 }
@@ -101,20 +111,64 @@ func resetEnv(envs ...string) {
 	}
 }
 
+// adminRequest sends an admin request to endpoint with the escaped query and basic auth, and hands a 2xx
+// response to handle when it is set; any other status comes back as responseError
+func (o SupportCmdOpts) adminRequest(ctx context.Context, method, endpoint string, query url.Values, body io.Reader,
+	handle func(*http.Response) error) error {
+	reqURL := endpoint + "?" + query.Encode()
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
+	if err != nil {
+		return fmt.Errorf("can't make request for %s: %w", reqURL, err)
+	}
+	req.SetBasicAuth("admin", o.AdminPasswd)
+
+	client := http.Client{}
+	defer client.CloseIdleConnections()
+	resp, err := client.Do(req) //nolint:gosec // reqURL is built from operator-supplied CLI flags, not user input
+	if err != nil {
+		return fmt.Errorf("request failed for %s: %w", reqURL, err)
+	}
+	defer func() {
+		if err = resp.Body.Close(); err != nil {
+			log.Printf("[WARN] failed to close response, %s", err)
+		}
+	}()
+	if resp.StatusCode >= 300 {
+		return responseError(resp)
+	}
+	if handle == nil {
+		return nil
+	}
+	return handle(resp)
+}
+
+// logResponse logs the status and body of a completed admin request
+func logResponse(resp *http.Response) error {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("can't get response: %w", err)
+	}
+	log.Printf("[INFO] completed, status=%d, %s", resp.StatusCode, string(body))
+	return nil
+}
+
 // responseError returns error with status and response body
 func responseError(resp *http.Response) error {
-	body, e := ioutil.ReadAll(resp.Body)
+	body, e := io.ReadAll(resp.Body)
 	if e != nil {
 		body = []byte("")
 	}
-	return errors.Errorf("error response %q, %s", resp.Status, body)
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("error response %q, ensure you have set ADMIN_PASSWD and provided it to the command you're running: %s", resp.Status, body)
+	}
+	return fmt.Errorf("error response %q, %s", resp.Status, body)
 }
 
 // mkdir -p for all dirs
 func makeDirs(dirs ...string) error {
 	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0700); err != nil { // If path is already a directory, MkdirAll does nothing
-			return errors.Wrapf(err, "can't make directory %s", dir)
+		if err := os.MkdirAll(dir, 0o700); err != nil { // if path is already a directory, MkdirAll does nothing
+			return fmt.Errorf("can't make directory %s: %w", dir, err)
 		}
 	}
 	return nil

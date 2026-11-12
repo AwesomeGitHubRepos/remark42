@@ -1,6 +1,9 @@
 node_modules
 extracted-messages
-/public
-/*.log
+*.log
 .env
 tsconfig.tsbuildinfo
+coverage
+public
+dist
+!remark42

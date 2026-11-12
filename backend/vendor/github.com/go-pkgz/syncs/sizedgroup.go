@@ -11,13 +11,13 @@ import (
 type SizedGroup struct {
 	options
 	wg   sync.WaitGroup
-	sema sync.Locker
+	sema Locker
 }
 
 // NewSizedGroup makes wait group with limited size alive goroutines
 func NewSizedGroup(size int, opts ...GroupOption) *SizedGroup {
 	res := SizedGroup{sema: NewSemaphore(size)}
-	res.options.ctx = context.Background()
+	res.ctx = context.Background()
 	for _, opt := range opts {
 		opt(&res.options)
 	}
@@ -27,7 +27,6 @@ func NewSizedGroup(size int, opts ...GroupOption) *SizedGroup {
 // Go calls the given function in a new goroutine.
 // Every call will be unblocked, but some goroutines may wait if semaphore locked.
 func (g *SizedGroup) Go(fn func(ctx context.Context)) {
-
 	canceled := func() bool {
 		select {
 		case <-g.ctx.Done():
@@ -41,14 +40,27 @@ func (g *SizedGroup) Go(fn func(ctx context.Context)) {
 		return
 	}
 
-	g.wg.Add(1)
-
 	if g.preLock {
-		g.sema.Lock()
+		lockOk := g.sema.TryLock()
+		if !lockOk && g.discardIfFull {
+			// lock failed and discardIfFull is set, discard this goroutine
+			return
+		}
+		if !lockOk && !g.discardIfFull {
+			g.sema.Lock() // make sure we have block until lock is acquired
+		}
 	}
 
+	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
+
+		isLocked := g.preLock // with preLock the permit is already held by the time goroutine starts
+		defer func() {
+			if isLocked {
+				g.sema.Unlock()
+			}
+		}()
 
 		if canceled() {
 			return
@@ -56,10 +68,10 @@ func (g *SizedGroup) Go(fn func(ctx context.Context)) {
 
 		if !g.preLock {
 			g.sema.Lock()
+			isLocked = true
 		}
 
 		fn(g.ctx)
-		g.sema.Unlock()
 	}()
 }
 

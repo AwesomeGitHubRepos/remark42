@@ -1,7 +1,6 @@
 package migrator
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 	"time"
@@ -17,13 +16,7 @@ import (
 )
 
 func TestMigrator_ImportDisqus(t *testing.T) {
-	defer func() {
-		os.Remove("/tmp/remark-test.db")
-		os.Remove("/tmp/disqus-test.xml")
-	}()
-
-	err := ioutil.WriteFile("/tmp/disqus-test.xml", []byte(xmlTestDisqus), 0600)
-	require.NoError(t, err)
+	defer os.Remove("/tmp/remark-test.db")
 
 	b, err := engine.NewBoltDB(bolt.Options{}, engine.BoltSite{FileName: "/tmp/remark-test.db", SiteID: "test"})
 	require.NoError(t, err, "create store")
@@ -31,7 +24,7 @@ func TestMigrator_ImportDisqus(t *testing.T) {
 	defer dataStore.Close()
 	size, err := ImportComments(ImportParams{
 		DataStore: dataStore,
-		InputFile: "/tmp/disqus-test.xml",
+		InputFile: "testdata/disqus.xml",
 		SiteID:    "test",
 		Provider:  "disqus",
 	})
@@ -49,7 +42,7 @@ func TestMigrator_ImportWordPress(t *testing.T) {
 		os.Remove("/tmp/wordpress-test.xml")
 	}()
 
-	err := ioutil.WriteFile("/tmp/wordpress-test.xml", []byte(xmlTestWP), 0600)
+	err := os.WriteFile("/tmp/wordpress-test.xml", []byte(xmlTestWP), 0o600)
 	require.NoError(t, err)
 
 	b, err := engine.NewBoltDB(bolt.Options{}, engine.BoltSite{FileName: "/tmp/remark-test.db", SiteID: "test"})
@@ -70,6 +63,27 @@ func TestMigrator_ImportWordPress(t *testing.T) {
 	assert.Equal(t, 3, len(last), "3 comments imported")
 }
 
+func TestMigrator_ImportCommento(t *testing.T) {
+	defer os.Remove("/tmp/remark-test.db")
+
+	b, err := engine.NewBoltDB(bolt.Options{}, engine.BoltSite{FileName: "/tmp/remark-test.db", SiteID: "test"})
+	require.NoError(t, err, "create store")
+	dataStore := &service.DataStore{Engine: b, AdminStore: admin.NewStaticStore("12345", nil, []string{}, "")}
+	defer dataStore.Close()
+	size, err := ImportComments(ImportParams{
+		DataStore: dataStore,
+		InputFile: "testdata/commento.json",
+		SiteID:    "test",
+		Provider:  "commento",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, 3, size)
+
+	last, err := dataStore.Last("test", 10, time.Time{}, store.User{})
+	assert.NoError(t, err)
+	assert.Equal(t, 3, len(last), "3 comments imported")
+}
+
 func TestMigrator_ImportNative(t *testing.T) {
 	defer func() {
 		os.Remove("/tmp/remark-test.db")
@@ -79,7 +93,7 @@ func TestMigrator_ImportNative(t *testing.T) {
 	data := `{"version":1} {"id":"efbc17f177ee1a1c0ee6e1e025749966ec071adc","pid":"","text":"some text, <a href=\"http://radio-t.com\" rel=\"nofollow\">link</a>","user":{"name":"user name","id":"user1","picture":"","profile":"","admin":false},"locator":{"site":"radio-t","url":"https://radio-t.com"},"score":0,"votes":{},"time":"2017-12-20T15:18:22-06:00"}` + "\n" +
 		`{"id":"afbc17f177ee1a1c0ee6e1e025749966ec071adc","pid":"efbc17f177ee1a1c0ee6e1e025749966ec071adc","text":"some text2, <a href=\"http://radio-t.com\" rel=\"nofollow\">link</a>","user":{"name":"user name","id":"user1","picture":"","profile":"","admin":false},"locator":{"site":"radio-t","url":"https://radio-t.com"},"score":0,"votes":{},"time":"2017-12-20T15:18:23-06:00"}` + "\n"
 
-	err := ioutil.WriteFile("/tmp/disqus-test.r42", []byte(data), 0600)
+	err := os.WriteFile("/tmp/disqus-test.r42", []byte(data), 0o600)
 	require.NoError(t, err)
 
 	b, err := engine.NewBoltDB(bolt.Options{}, engine.BoltSite{FileName: "/tmp/remark-test.db", SiteID: "radio-t"})

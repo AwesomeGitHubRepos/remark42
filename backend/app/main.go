@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -8,7 +9,7 @@ import (
 	"syscall"
 
 	log "github.com/go-pkgz/lgr"
-	"github.com/umputun/go-flags"
+	"github.com/jessevdk/go-flags"
 
 	"github.com/umputun/remark42/backend/app/cmd"
 )
@@ -23,8 +24,9 @@ type Opts struct {
 	CleanupCmd cmd.CleanupCommand `command:"cleanup"`
 	RemapCmd   cmd.RemapCommand   `command:"remap"`
 
-	RemarkURL    string `long:"url" env:"REMARK_URL" required:"true" description:"url to remark"`
-	SharedSecret string `long:"secret" env:"SECRET" required:"true" description:"shared secret key"`
+	RemarkURL string `long:"url" env:"REMARK_URL" required:"true" description:"url to remark"`
+	// SharedSecret is only used in server command, but defined for all commands for historical reasons
+	SharedSecret string `long:"secret" env:"SECRET" required:"true" description:"the shared secret key used to sign JWT, should be a random, long, hard-to-guess string"`
 
 	Dbg bool `long:"dbg" env:"DEBUG" description:"debug mode"`
 }
@@ -45,10 +47,7 @@ func main() {
 			SharedSecret: opts.SharedSecret,
 			Revision:     revision,
 		})
-		for _, entry := range c.HandleDeprecatedFlags() {
-			log.Printf("[WARN] --%s is deprecated and will be removed in v%s, please use --%s instead",
-				entry.Old, entry.RemoveVersion, entry.New)
-		}
+		logDeprecatedParams(c.HandleDeprecatedFlags())
 		err := c.Execute(args)
 		if err != nil {
 			log.Printf("[ERROR] failed with %+v", err)
@@ -57,11 +56,11 @@ func main() {
 	}
 
 	if _, err := p.Parse(); err != nil {
-		if flagsErr, ok := err.(*flags.Error); ok && flagsErr.Type == flags.ErrHelp {
+		var flagsErr *flags.Error
+		if errors.As(err, &flagsErr) && flagsErr.Type == flags.ErrHelp {
 			os.Exit(0)
-		} else {
-			os.Exit(1)
 		}
+		os.Exit(1)
 	}
 }
 
@@ -73,21 +72,34 @@ func setupLog(dbg bool) {
 	log.Setup(log.Msec, log.LevelBraces)
 }
 
+// logs usual and "collision" deprecated parameters
+func logDeprecatedParams(params []cmd.DeprecatedFlag) {
+	for _, entry := range params {
+		var deprecationNote string
+		if entry.Collision {
+			deprecationNote = fmt.Sprintf("[ERROR] deprecated --%s and new --%s options are set to different values, old one is ignored: please remove it", entry.Old, entry.New)
+		} else {
+			deprecationNote = fmt.Sprintf("[WARN] --%s is deprecated since v%s and will be removed in the future", entry.Old, entry.Version)
+			if entry.New != "" {
+				deprecationNote += fmt.Sprintf(", please use --%s instead", entry.New)
+			}
+		}
+		log.Print(deprecationNote)
+	}
+}
+
 // getDump reads runtime stack and returns as a string
 func getDump() string {
 	maxSize := 5 * 1024 * 1024
 	stacktrace := make([]byte, maxSize)
-	length := runtime.Stack(stacktrace, true)
-	if length > maxSize {
-		length = maxSize
-	}
+	length := min(runtime.Stack(stacktrace, true), maxSize)
 	return string(stacktrace[:length])
 }
 
-// nolint:gochecknoinits // can't avoid it in this place
+//nolint:gochecknoinits // can't avoid it in this place
 func init() {
 	// catch SIGQUIT and print stack traces
-	sigChan := make(chan os.Signal)
+	sigChan := make(chan os.Signal, 1)
 	go func() {
 		for range sigChan {
 			log.Printf("[INFO] SIGQUIT detected, dump:\n%s", getDump())

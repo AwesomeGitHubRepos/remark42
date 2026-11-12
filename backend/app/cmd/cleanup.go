@@ -1,29 +1,30 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	log "github.com/go-pkgz/lgr"
-	"github.com/pkg/errors"
 
 	"github.com/umputun/remark42/backend/app/store"
 )
 
 // CleanupCommand set of flags and command for cleanup
 type CleanupCommand struct {
-	Site        string   `short:"s" long:"site" env:"SITE" default:"remark" description:"site name"`
-	Dry         bool     `long:"dry" description:"dry mode, will not remove comments"`
-	From        string   `long:"from" description:"from yyyymmdd"`
-	To          string   `long:"to" description:"from yyyymmdd"`
-	BadWords    []string `short:"w" long:"bword" description:"bad word(s)"`
-	BadUsers    []string `short:"u" long:"buser" description:"bad user(s)"`
-	AdminPasswd string   `long:"admin-passwd" env:"ADMIN_PASSWD" required:"true" description:"admin basic auth password"`
-	SetTitle    bool     `long:"title" description:"title mode, will not remove comments, but reset titles to page's title'"`
+	Dry      bool     `long:"dry" description:"dry mode, will not remove comments"`
+	From     string   `long:"from" description:"from yyyymmdd"`
+	To       string   `long:"to" description:"from yyyymmdd"`
+	BadWords []string `short:"w" long:"bword" description:"bad word(s)"`
+	BadUsers []string `short:"u" long:"buser" description:"bad user(s)"`
+	SetTitle bool     `long:"title" description:"title mode, will not remove comments, but reset titles to page's title'"`
+
+	SupportCmdOpts
 	CommonOpts
 }
 
@@ -39,7 +40,7 @@ func (cc *CleanupCommand) Execute(_ []string) error {
 
 	posts, err := cc.postsInRange(cc.From, cc.To)
 	if err != nil {
-		return errors.Wrap(err, "can't get posts")
+		return fmt.Errorf("can't get posts: %w", err)
 	}
 	log.Printf("[DEBUG] got %d posts", len(posts))
 
@@ -55,7 +56,6 @@ func (cc *CleanupCommand) Execute(_ []string) error {
 			cc.procTitles(comments)
 		} else {
 			spamComments += cc.procSpam(comments)
-
 		}
 	}
 
@@ -79,7 +79,7 @@ func (cc *CleanupCommand) procSpam(comments []store.Comment) int {
 					log.Printf("[WARN] can't remove comment, %v", err)
 				}
 			}
-			comment.Text = strings.Replace(comment.Text, "\n", " ", -1)
+			comment.Text = strings.ReplaceAll(comment.Text, "\n", " ")
 			log.Printf("[SPAM] %+v [%.0f%%]", comment, score)
 		}
 	}
@@ -100,7 +100,7 @@ func (cc *CleanupCommand) procTitles(comments []store.Comment) {
 func (cc *CleanupCommand) postsInRange(fromS, toS string) ([]store.PostInfo, error) {
 	posts, err := cc.listPosts()
 	if err != nil {
-		return nil, errors.Wrapf(err, "can't list posts for %s", cc.Site)
+		return nil, fmt.Errorf("can't list posts for %s: %w", cc.Site, err)
 	}
 
 	from, to := defaultFrom, defaultTo
@@ -108,14 +108,14 @@ func (cc *CleanupCommand) postsInRange(fromS, toS string) ([]store.PostInfo, err
 	if fromS != "" {
 		from, err = time.ParseInLocation("20060102", fromS, time.Local)
 		if err != nil {
-			return nil, errors.Wrap(err, "can't parse --from")
+			return nil, fmt.Errorf("can't parse --from: %w", err)
 		}
 	}
 
 	if toS != "" {
 		to, err = time.ParseInLocation("20060102", toS, time.Local)
 		if err != nil {
-			return nil, errors.Wrap(err, "can't parse --to")
+			return nil, fmt.Errorf("can't parse --to: %w", err)
 		}
 	}
 
@@ -130,39 +130,40 @@ func (cc *CleanupCommand) postsInRange(fromS, toS string) ([]store.PostInfo, err
 
 // get all posts via GET /list?site=siteID&limit=50&skip=10
 func (cc *CleanupCommand) listPosts() ([]store.PostInfo, error) {
-	listURL := fmt.Sprintf("%s/api/v1/list?site=%s&limit=10000", cc.RemarkURL, cc.Site)
+	listURL := fmt.Sprintf("%s/api/v1/list?site=%s&limit=10000", cc.RemarkURL, url.QueryEscape(cc.Site))
 	client := http.Client{Timeout: 30 * time.Second}
+	defer client.CloseIdleConnections()
 	r, err := client.Get(listURL)
 	if err != nil {
-		return nil, errors.Wrapf(err, "get request failed for list of posts, site %s", cc.Site)
+		return nil, fmt.Errorf("get request failed for list of posts, site %s: %w", cc.Site, err)
 	}
 	defer func() { _ = r.Body.Close() }()
 
 	if r.StatusCode != 200 {
-		return nil, errors.Errorf("request %s failed with status %d", listURL, r.StatusCode)
+		return nil, fmt.Errorf("request %s failed with status %d", listURL, r.StatusCode)
 	}
 
 	list := []store.PostInfo{}
 	if err = json.NewDecoder(r.Body).Decode(&list); err != nil {
-		return nil, errors.Wrapf(err, "can't decode list of posts for site %s", cc.Site)
+		return nil, fmt.Errorf("can't decode list of posts for site %s: %w", cc.Site, err)
 	}
 	return list, nil
 }
 
 // get all comments for post url via /find?site=siteID&url=post-url&format=[tree|plain]
 func (cc *CleanupCommand) listComments(postURL string) ([]store.Comment, error) {
-
-	commentsURL := fmt.Sprintf("%s/api/v1/find?site=%s&url=%s&format=plain", cc.RemarkURL, cc.Site, postURL)
+	commentsURL := fmt.Sprintf("%s/api/v1/find?site=%s&url=%s&format=plain", cc.RemarkURL, url.QueryEscape(cc.Site), url.QueryEscape(postURL))
 
 	var r *http.Response
 	var err error
 
 	// handle 429 error from limiter
+	client := http.Client{Timeout: 30 * time.Second}
+	defer client.CloseIdleConnections()
 	for {
-		client := http.Client{Timeout: 30 * time.Second}
 		r, err = client.Get(commentsURL)
 		if err != nil {
-			return nil, errors.Wrapf(err, "get request failed for comments, %s", postURL)
+			return nil, fmt.Errorf("get request failed for comments, %s: %w", postURL, err)
 		}
 		if r.StatusCode == http.StatusTooManyRequests {
 			_ = r.Body.Close()
@@ -175,67 +176,39 @@ func (cc *CleanupCommand) listComments(postURL string) ([]store.Comment, error) 
 	defer func() { _ = r.Body.Close() }()
 
 	if r.StatusCode != http.StatusOK {
-		return nil, errors.Errorf("request %s failed with status %d", commentsURL, r.StatusCode)
+		return nil, fmt.Errorf("request %s failed with status %d", commentsURL, r.StatusCode)
 	}
 
 	commentsWithInfo := struct {
 		Comments []store.Comment `json:"comments"`
-		Info     store.PostInfo  `json:"info,omitempty"`
+		Info     store.PostInfo  `json:"info"`
 	}{}
 
 	if err = json.NewDecoder(r.Body).Decode(&commentsWithInfo); err != nil {
-		return nil, errors.Wrapf(err, "can't decode list of comments for %s", postURL)
+		return nil, fmt.Errorf("can't decode list of comments for %s: %w", postURL, err)
 	}
 	return commentsWithInfo.Comments, nil
 }
 
 // deleteComment with DELETE /admin/comment/{id}?site=siteID&url=post-url
 func (cc *CleanupCommand) deleteComment(c store.Comment) error {
-
-	deleteURL := fmt.Sprintf("%s/api/v1/admin/comment/%s?site=%s&url=%s&format=plain", cc.RemarkURL, c.ID, cc.Site, c.Locator.URL)
-	req, err := http.NewRequest("DELETE", deleteURL, nil)
-	if err != nil {
-		return errors.Wrapf(err, "failed to make delete request for comment %s, %s", c.ID, c.Locator.URL)
-	}
-	req.SetBasicAuth("admin", cc.AdminPasswd)
-
-	client := http.Client{}
-	r, err := client.Do(req)
-	if err != nil {
-		return errors.Wrapf(err, "delete request failed for comment %s, %s", c.ID, c.Locator.URL)
-	}
-	defer func() { _ = r.Body.Close() }()
-	if r.StatusCode != http.StatusOK {
-		return errors.Errorf("delete request failed with status %s", r.Status)
-	}
-	return nil
+	return cc.commentRequest(http.MethodDelete, "comment", c)
 }
 
 // setTitle with PUT /admin/title/{id}?site=siteID&url=post-url
 func (cc *CleanupCommand) setTitle(c store.Comment) error {
+	return cc.commentRequest(http.MethodPut, "title", c)
+}
 
-	titleURL := fmt.Sprintf("%s/api/v1/admin/title/%s?site=%s&url=%s&format=plain", cc.RemarkURL, c.ID, cc.Site, c.Locator.URL)
-	req, err := http.NewRequest("PUT", titleURL, nil)
-	if err != nil {
-		return errors.Wrapf(err, "failed to make title request for comment %s, %s", c.ID, c.Locator.URL)
-	}
-	req.SetBasicAuth("admin", cc.AdminPasswd)
-
-	client := http.Client{}
-	r, err := client.Do(req)
-	if err != nil {
-		return errors.Wrapf(err, "title request failed for comment %s, %s", c.ID, c.Locator.URL)
-	}
-	defer func() { _ = r.Body.Close() }()
-	if r.StatusCode != http.StatusOK {
-		return errors.Errorf("title request failed with status %s", r.Status)
-	}
-	return nil
+// commentRequest sends method to /admin/{route}/{id}?site=siteID&url=post-url
+func (cc *CleanupCommand) commentRequest(method, route string, c store.Comment) error {
+	endpoint := fmt.Sprintf("%s/api/v1/admin/%s/%s", cc.RemarkURL, route, url.PathEscape(c.ID))
+	query := url.Values{"site": {cc.Site}, "url": {c.Locator.URL}, "format": {"plain"}}
+	return cc.adminRequest(context.Background(), method, endpoint, query, http.NoBody, nil)
 }
 
 // isSpam calculates spam's probability as a score
 func (cc *CleanupCommand) isSpam(comment store.Comment) (isSpam bool, spamScore float64) {
-
 	badWord := func(txt string) float64 {
 		res := 0.0
 		for _, w := range cc.BadWords {

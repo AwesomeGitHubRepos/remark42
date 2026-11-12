@@ -8,11 +8,11 @@ package accessor
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
 	log "github.com/go-pkgz/lgr"
-	"github.com/pkg/errors"
 
 	"github.com/umputun/remark42/backend/app/store/image"
 )
@@ -22,7 +22,7 @@ type MemImage struct {
 	imagesStaging map[string][]byte
 	images        map[string][]byte
 	insertTime    map[string]time.Time
-	sync.RWMutex
+	mu            sync.RWMutex
 }
 
 // NewMemImageStore makes admin Store in memory.
@@ -37,40 +37,62 @@ func NewMemImageStore() *MemImage {
 
 // Save stores image with passed id to staging
 func (m *MemImage) Save(id string, img []byte) error {
-	m.Lock()
+	m.mu.Lock()
 	m.imagesStaging[id] = img
 	m.insertTime[id] = time.Now()
-	m.Unlock()
+	m.mu.Unlock()
 
 	return nil
 }
 
+// ResetCleanupTimer resets cleanup timer for the image
+func (m *MemImage) ResetCleanupTimer(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.insertTime[id]; ok {
+		m.insertTime[id] = time.Now()
+		return nil
+	}
+	return fmt.Errorf("image %s not found", id)
+}
+
 // Load image by ID
 func (m *MemImage) Load(id string) ([]byte, error) {
-	m.RLock()
+	m.mu.RLock()
 	img, ok := m.images[id]
 	if !ok {
 		img, ok = m.imagesStaging[id]
 	}
-	m.RUnlock()
+	m.mu.RUnlock()
 	if !ok {
-		return nil, errors.Errorf("image %s not found", id)
+		return nil, fmt.Errorf("image %s not found", id)
 	}
 	return img, nil
 }
 
+// Delete image by ID
+func (m *MemImage) Delete(id string) error {
+	m.mu.Lock()
+	// delete key from permanent and staging storage
+	delete(m.images, id)
+	delete(m.insertTime, id)
+	delete(m.imagesStaging, id)
+	m.mu.Unlock()
+	return nil
+}
+
 // Commit moves image from staging to permanent
 func (m *MemImage) Commit(id string) error {
-	m.RLock()
+	m.mu.RLock()
 	img, ok := m.imagesStaging[id]
-	m.RUnlock()
+	m.mu.RUnlock()
 	if !ok {
-		return errors.Errorf("failed to commit %s, not found in staging", id)
+		return fmt.Errorf("failed to commit %s, not found in staging", id)
 	}
 
-	m.Lock()
+	m.mu.Lock()
 	m.images[id] = img
-	m.Unlock()
+	m.mu.Unlock()
 
 	return nil
 }
@@ -79,7 +101,7 @@ func (m *MemImage) Commit(id string) error {
 func (m *MemImage) Cleanup(_ context.Context, ttl time.Duration) error {
 	var idsToRemove []string
 
-	m.RLock()
+	m.mu.RLock()
 	for id, t := range m.insertTime {
 		age := time.Since(t)
 		if age > ttl {
@@ -87,27 +109,27 @@ func (m *MemImage) Cleanup(_ context.Context, ttl time.Duration) error {
 			idsToRemove = append(idsToRemove, id)
 		}
 	}
-	m.RUnlock()
+	m.mu.RUnlock()
 
-	m.Lock()
+	m.mu.Lock()
 	for _, id := range idsToRemove {
 		delete(m.insertTime, id)
 		delete(m.imagesStaging, id)
 	}
-	m.Unlock()
+	m.mu.Unlock()
 	return nil
 }
 
 // Info returns meta information about storage
 func (m *MemImage) Info() (image.StoreInfo, error) {
 	var ts time.Time
-	m.RLock()
+	m.mu.RLock()
 	for _, t := range m.insertTime {
 		if ts.IsZero() || t.Before(ts) {
 			ts = t
 		}
 	}
-	m.RUnlock()
+	m.mu.RUnlock()
 
 	return image.StoreInfo{FirstStagingImageTS: ts}, nil
 }

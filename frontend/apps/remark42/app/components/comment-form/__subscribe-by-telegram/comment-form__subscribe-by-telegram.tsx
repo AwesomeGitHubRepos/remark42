@@ -1,0 +1,193 @@
+import clsx from 'clsx';
+import type { FunctionComponent } from 'preact';
+import { h, Fragment } from 'preact';
+import { useState, useEffect } from 'preact/hooks';
+import { useSelector } from 'store/context';
+
+import { useIntl, defineMessages } from 'common/intl';
+import type { User } from 'common/types';
+import type { StoreState } from 'store';
+import type { FetcherError, RequestError } from 'utils/errorUtils';
+import { extractErrorMessageFromResponse } from 'utils/errorUtils';
+import { useTheme } from 'hooks/useTheme';
+import { useSessionStorage } from 'hooks/useSessionState';
+import { telegramSubscribe, telegramCurrentSubscribtion, telegramUnsubcribe } from 'common/api';
+import { Dropdown } from 'components/dropdown';
+import { isUserAnonymous } from 'utils/isUserAnonymous';
+import { TelegramLink } from 'components/telegram/telegram-link';
+import { Preloader } from 'components/preloader';
+import { Button } from 'components/button';
+
+import styles from './comment-form__subscribe-by-telegram.module.css';
+
+const messages = defineMessages({
+  haveSubscribed: {
+    id: 'subscribeByTelegram.have-been-subscribed',
+    defaultMessage: 'You have subscribed to Telegram updates',
+  },
+  haveUnsubscribed: {
+    id: 'subscribeByTelegram.have-been-unsubscribed',
+    defaultMessage: 'You have unsubscribed from Telegram updates',
+  },
+  unsubscribe: {
+    id: 'subscribeByTelegram.unsubscribe',
+    defaultMessage: 'Unsubscribe',
+  },
+  resubscribe: {
+    id: 'subscribeByTelegram.resubscribe',
+    defaultMessage: 'Resubscribe',
+  },
+  subscribeByTelegram: {
+    id: 'subscribeByTelegram.subscribe-by-telegram',
+    defaultMessage: 'Subscribe by Telegram',
+  },
+  onlyRegisteredUsers: {
+    id: 'subscribeByTelegram.only-registered-users',
+    defaultMessage: 'Only available to registered users',
+  },
+  telegram: {
+    id: 'subscribeByTelegram.telegram',
+    defaultMessage: 'Telegram',
+  },
+});
+
+type STEP = 'initial' | 'subscribed' | 'unsubscribed';
+
+export const SubscribeByTelegramForm: FunctionComponent = () => {
+  const intl = useIntl();
+  const [step, setStep] = useSessionStorage<STEP>('telegram-subscription-step', 'initial');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const [telegram, setTelegram] = useSessionStorage<{ token: string; bot: string } | null>(
+    'telegram-subscription-telegram',
+    null
+  );
+
+  const fetchTelegram = async (showLoading = true): Promise<boolean> => {
+    if (showLoading) {
+      setLoading(true);
+    }
+    try {
+      const { token, bot } = await telegramSubscribe();
+      setTelegram({ token, bot });
+      return true;
+    } catch (e) {
+      if ((e as RequestError).error === 'already subscribed') {
+        setStep('subscribed');
+        return false;
+      }
+      if ((e as RequestError).code === 409) {
+        setStep('subscribed');
+        return false;
+      }
+      setError(extractErrorMessageFromResponse(e as FetcherError, intl));
+      return false;
+    } finally {
+      if (showLoading) {
+        setLoading(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (telegram) {
+      return;
+    }
+    void fetchTelegram();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [telegram]);
+
+  const fetchTelegramSubscription = async (token: string) => {
+    try {
+      setTimeout(() => {
+        // to prevent dropdown closing
+        setLoading(true);
+      }, 0);
+      const { updated } = await telegramCurrentSubscribtion({ token });
+      setError(null);
+      if (!updated) {
+        return;
+      }
+      setStep('subscribed');
+    } catch (err) {
+      setError(extractErrorMessageFromResponse(err, intl));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleTelegramCheck = () => {
+    if (!telegram) {
+      return;
+    }
+    fetchTelegramSubscription(telegram.token);
+  };
+
+  const handleTelegramUnsubscribe = async () => {
+    try {
+      setTimeout(() => {
+        // to prevent dropdown closing
+        setLoading(true);
+      }, 0);
+      await telegramUnsubcribe();
+      setError(null);
+      setStep('unsubscribed');
+    } catch (err) {
+      setError(extractErrorMessageFromResponse(err, intl));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleTelegramResubscribe = async () => {
+    setError(null);
+    if (await fetchTelegram(false)) {
+      setStep('initial');
+    }
+  };
+  return (
+    <div className={clsx(styles.root)}>
+      {loading && <Preloader className={clsx(styles.preloader)} />}
+      {!loading && error && (!telegram || step !== 'initial') && <div className="auth-error">{error}</div>}
+      {!loading && telegram && step === 'initial' && (
+        <TelegramLink errorMessage={error} onSubmit={handleTelegramCheck} bot={telegram.bot} token={telegram.token} />
+      )}
+      {!loading && step === 'subscribed' && (
+        <>
+          <p>{intl.formatMessage(messages.haveSubscribed)}</p>
+          <Button kind="primary" size="large" onClick={handleTelegramUnsubscribe}>
+            {intl.formatMessage(messages.unsubscribe)}
+          </Button>
+        </>
+      )}
+      {!loading && step === 'unsubscribed' && (
+        <>
+          <p>{intl.formatMessage(messages.haveUnsubscribed)}</p>
+          <Button kind="primary" size="large" onClick={handleTelegramResubscribe}>
+            {intl.formatMessage(messages.resubscribe)}
+          </Button>
+        </>
+      )}
+    </div>
+  );
+};
+
+export const SubscribeByTelegram: FunctionComponent = () => {
+  const theme = useTheme();
+  const intl = useIntl();
+  const user = useSelector<StoreState, User | null>(({ user }) => user);
+  const isAnonymous = isUserAnonymous(user);
+  const buttonTitle = intl.formatMessage(isAnonymous ? messages.onlyRegisteredUsers : messages.subscribeByTelegram);
+
+  return (
+    <Dropdown
+      title={intl.formatMessage(messages.telegram)}
+      theme={theme}
+      disabled={isAnonymous}
+      buttonTitle={buttonTitle}
+    >
+      <SubscribeByTelegramForm />
+    </Dropdown>
+  );
+};

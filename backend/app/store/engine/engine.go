@@ -4,6 +4,7 @@ package engine
 // Includes default implementation with boltdb
 
 import (
+	"errors"
 	"sort"
 	"strings"
 	"time"
@@ -11,8 +12,16 @@ import (
 	"github.com/umputun/remark42/backend/app/store"
 )
 
-// NOTE: mockery works from linked to go-path and with GOFLAGS='-mod=vendor' go generate
-//go:generate sh -c "mockery -inpkg -name Interface -print > /tmp/engine-mock.tmp && mv /tmp/engine-mock.tmp engine_mock.go"
+// ErrSiteNotFound is returned by engines when the requested site does not exist.
+// Its message is "not found" so wrapping it as `site %q %w` reads "site \"x\" not found".
+var ErrSiteNotFound = errors.New("not found")
+
+// ErrNoUserComments is returned by engines when a user has no comments on the site.
+// Its message is "no comments for user", so wrapping it as `%w %s in store` keeps the established error text.
+var ErrNoUserComments = errors.New("no comments for user")
+
+// NOTE: matryer/moq should be installed globally and works with `go generate ./...`
+//go:generate moq --out engine_mock.go . Interface
 
 // Interface defines methods provided by low-level storage engine
 type Interface interface {
@@ -24,7 +33,7 @@ type Interface interface {
 	Count(req FindRequest) (int, error)                         // get count for post or user
 	Delete(req DeleteRequest) error                             // Delete post(s), user, comment, user details, or everything
 	Flag(req FlagRequest) (bool, error)                         // set and get flags
-	ListFlags(req FlagRequest) ([]interface{}, error)           // get list of flagged keys, like blocked & verified user
+	ListFlags(req FlagRequest) ([]any, error)                   // get list of flagged keys, like blocked & verified user
 
 	// UserDetail sets or gets single detail value, or gets all details for requested site
 	// Returns list even for single entry request is a compromise in order to have both single detail getting and setting
@@ -45,7 +54,7 @@ type FindRequest struct {
 	Locator store.Locator `json:"locator"`           // lack of URL means site operation
 	UserID  string        `json:"user_id,omitempty"` // presence of UserID treated as user-related find
 	Sort    string        `json:"sort,omitempty"`    // sort order with +/-field syntax
-	Since   time.Time     `json:"since,omitempty"`   // time limit for found results
+	Since   time.Time     `json:"since"`             // time limit for found results
 	Limit   int           `json:"limit,omitempty"`
 	Skip    int           `json:"skip,omitempty"`
 }
@@ -91,6 +100,8 @@ const (
 const (
 	// UserEmail is a user email
 	UserEmail = UserDetail("email")
+	// UserTelegram is a user telegram
+	UserTelegram = UserDetail("telegram")
 	// AllUserDetails used for listing and deletion requests
 	AllUserDetails = UserDetail("all")
 )
@@ -109,8 +120,9 @@ type UserDetail string
 
 // UserDetailEntry contains single user details entry
 type UserDetailEntry struct {
-	UserID string `json:"user_id"`         // duplicate user's id to use this structure not only embedded but separately
-	Email  string `json:"email,omitempty"` // UserEmail
+	UserID   string `json:"user_id"`            // duplicate user's id to use this structure not only embedded but separately
+	Email    string `json:"email,omitempty"`    // UserEmail
+	Telegram string `json:"telegram,omitempty"` // UserTelegram
 }
 
 // UserDetailRequest is the input for both get/set for details, like email

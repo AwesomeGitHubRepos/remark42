@@ -2,8 +2,10 @@ package store
 
 import (
 	"fmt"
+	"html"
 	"html/template"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -15,7 +17,7 @@ type Comment struct {
 	ID          string                 `json:"id" bson:"_id"`
 	ParentID    string                 `json:"pid"`
 	Text        string                 `json:"text"`
-	Orig        string                 `json:"orig,omitempty"`
+	Orig        string                 `json:"orig,omitempty"` // important: never render this as HTML! It's not sanitized.
 	User        User                   `json:"user"`
 	Locator     Locator                `json:"locator"`
 	Score       int                    `json:"score"`
@@ -45,11 +47,13 @@ type Edit struct {
 
 // PostInfo holds summary for given post url
 type PostInfo struct {
-	URL      string    `json:"url"`
-	Count    int       `json:"count"`
-	ReadOnly bool      `json:"read_only,omitempty" bson:"read_only,omitempty"`
-	FirstTS  time.Time `json:"first_time,omitempty" bson:"first_time,omitempty"`
-	LastTS   time.Time `json:"last_time,omitempty" bson:"last_time,omitempty"`
+	URL         string    `json:"url,omitempty"` // can be attached to site-wide comments but won't be set then
+	Count       int       `json:"count"`
+	CountLeft   int       `json:"count_left"`                                     // used only with returning search results limited by number, otherwise zero
+	LastComment string    `json:"last_comment,omitempty"`                         // used only with returning search results limited by number
+	ReadOnly    bool      `json:"read_only,omitempty" bson:"read_only,omitempty"` // can be attached to site-wide comments but won't be set then
+	FirstTS     time.Time `json:"first_time" bson:"first_time,omitempty"`
+	LastTS      time.Time `json:"last_time" bson:"last_time,omitempty"`
 }
 
 // BlockedUser holds id and ts for blocked user
@@ -86,9 +90,11 @@ func (c *Comment) PrepareUntrusted() {
 	c.Votes = make(map[string]bool)
 	c.VotedIPs = make(map[string]VotedIPInfo)
 	c.Score = 0
+	c.Controversy = 0
 	c.Edit = nil
 	c.Pin = false
 	c.Deleted = false
+	c.Imported = false
 }
 
 // SetDeleted clears comment info, reset to deleted state. hard flag will clear all user info as well
@@ -96,6 +102,7 @@ func (c *Comment) SetDeleted(mode DeleteMode) {
 	c.Text = ""
 	c.Orig = ""
 	c.Score = 0
+	c.Controversy = 0
 	c.Votes = map[string]bool{}
 	c.VotedIPs = make(map[string]VotedIPInfo)
 	c.Edit = nil
@@ -110,24 +117,28 @@ func (c *Comment) SetDeleted(mode DeleteMode) {
 	}
 }
 
-// Sanitize clean dangerous html/js from the comment
+// Sanitize clean dangerous html/js from the comment.
+// Comment.Orig which is used to store the original comment text is not sanitized
+// as we expect to never render it as HTML and render Comment.Text instead
 func (c *Comment) Sanitize() {
 	p := bluemonday.UGCPolicy()
 	p.AllowAttrs("class").Matching(regexp.MustCompile("^chroma$")).OnElements("pre")
+	// special case for embedding the quotes from Twitter
+	p.AllowAttrs("class").Matching(regexp.MustCompile("^twitter-tweet$")).OnElements("blockquote")
 	// this is list of <span> tag classes which could be produced by chroma code renderer
-	// source: https://github.com/alecthomas/chroma/blob/022b6f4fc2c4aa819aac18363c8de3f70619200b/types.go#L221-L316
-	const codeSpanClassRegex = "^(chroma|ln|lnt|hl|lntable|lntd|w|err|x|esc|k|kc" +
+	// source: https://github.com/alecthomas/chroma/blob/c263f6f/types.go#L209-L306
+	const codeSpanClassRegex = "^(bg|chroma|line|ln|lnt|hl|lntable|lntd|lnlinks|cl|w|err|x|k|kc" +
 		"|kd|kn|kp|kr|kt|n|na|nb|bp|nc|no|nd|ni|ne|nf|fm|py|nl|nn|nx|nt|nv|vc|vg" +
 		"|vi|vm|l|ld|s|sa|sb|sc|dl|sd|s2|se|sh|si|sx|sr|s1|ss|m|mb|mf|mh|mi|il" +
 		"|mo|o|ow|p|c|ch|cm|cp|cpf|c1|cs|g|gd|ge|gr|gh|gi|go|gp|gs|gu|gt|gl)$"
 	p.AllowAttrs("class").Matching(regexp.MustCompile(codeSpanClassRegex)).OnElements("span")
 	p.AllowAttrs("loading").Matching(regexp.MustCompile("^(lazy|eager)$")).OnElements("img")
 	c.Text = p.Sanitize(c.Text)
-	c.Orig = p.Sanitize(c.Orig)
 	c.User.ID = template.HTMLEscapeString(c.User.ID)
-	c.User.Name = c.escapeHTMLWithSome(c.User.Name)
+	c.User.Name = c.SanitizeText(c.User.Name)
 	c.User.Picture = c.SanitizeAsURL(c.User.Picture)
 	c.Locator.URL = c.SanitizeAsURL(c.Locator.URL)
+	c.PostTitle = c.SanitizeText(c.PostTitle)
 }
 
 // Snippet from comment's text
@@ -135,18 +146,22 @@ func (c *Comment) Snippet(limit int) string {
 	if limit <= 0 {
 		limit = snippetLen
 	}
-	cleanText := strings.Replace(c.Text, "\n", " ", -1)
+	cleanText := strings.ReplaceAll(c.Text, "\n", " ")
 	size := len([]rune(cleanText))
 	if size < limit {
 		return cleanText
 	}
-	snippet := []rune(cleanText)[:size]
+	snippet := []rune(cleanText)[:limit]
 	// go back in snippet and found the first space
-	for i := len(snippet) - 1; i >= 0; i-- {
-		if snippet[i] == ' ' {
+	for i, s := range slices.Backward(snippet) {
+		if s == ' ' {
 			snippet = snippet[:i]
 			break
 		}
+	}
+	// don't add a space if comment is just a one single word which has been truncated.
+	if len(snippet) == limit {
+		return string(snippet) + "..."
 	}
 	return string(snippet) + " ..."
 }
@@ -156,18 +171,24 @@ var reHref = regexp.MustCompile(`<a\s+(?:[^>]*?\s+)?href="([^"]*)"`)
 // SanitizeAsURL drops dangerous code from a url.
 // It wraps input with href to trigger bluemonday sanitizer and cleans href after sanitizing done
 func (c *Comment) SanitizeAsURL(inp string) string {
-	h := fmt.Sprintf(`<a href="%s">`, inp)
+	h := fmt.Sprintf(`<a href=%q>`, html.EscapeString(inp))
 	clean := bluemonday.UGCPolicy().Sanitize(h)
 	if match := reHref.FindStringSubmatch(clean); len(match) > 1 {
-		return match[1]
+		return html.UnescapeString(match[1])
 	}
 	return "" // this shouldn't happen as we build the href
 }
 
 func (c *Comment) escapeHTMLWithSome(inp string) string {
 	res := template.HTMLEscapeString(inp)
-	res = strings.Replace(res, "&#34;", "\"", -1)
-	res = strings.Replace(res, "&#39;", "'", -1)
-	res = strings.Replace(res, "&amp;", "&", -1)
+	res = strings.ReplaceAll(res, "&amp;", "&")
+	res = strings.ReplaceAll(res, "&#34;", "\"")
+	res = strings.ReplaceAll(res, "&#39;", "'")
 	return res
+}
+
+// SanitizeText used to sanitize any input string, and removes any HTML tags
+func (c *Comment) SanitizeText(inp string) string {
+	clean := bluemonday.StrictPolicy().Sanitize(inp)
+	return strings.TrimSpace(c.escapeHTMLWithSome(clean))
 }

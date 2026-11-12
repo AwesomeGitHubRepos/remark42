@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sort"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -198,7 +199,7 @@ func TestMemData_FindForUserPagination(t *testing.T) {
 	}
 
 	// write 200 comments
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		c.ID = fmt.Sprintf("idd-%d", i)
 		c.Text = fmt.Sprintf("text #%d", i)
 		c.Timestamp = time.Date(2017, 12, 20, 15, 18, i, 0, time.Local)
@@ -286,7 +287,7 @@ func TestMemData_CountUser(t *testing.T) {
 
 func TestMemData_InfoPost(t *testing.T) {
 	b := prepMem(t)
-	ts := func(min int) time.Time { return time.Date(2017, 12, 20, 15, 18, min, 0, time.Local).In(time.UTC) }
+	ts := func(minute int) time.Time { return time.Date(2017, 12, 20, 15, 18, minute, 0, time.Local).In(time.UTC) }
 
 	// add one more for https://radio-t.com/2
 	comment := store.Comment{
@@ -484,7 +485,7 @@ func TestMemData_FlagVerified(t *testing.T) {
 func TestMemData_FlagListVerified(t *testing.T) {
 
 	b := prepMem(t)
-	toIDs := func(inp []interface{}) (res []string) {
+	toIDs := func(inp []any) (res []string) {
 		res = make([]string, len(inp))
 		for i, v := range inp {
 			vv, ok := v.(string)
@@ -521,51 +522,52 @@ func TestMemData_FlagListVerified(t *testing.T) {
 }
 
 func TestMemData_FlagListBlocked(t *testing.T) {
-
-	b := prepMem(t)
-	setBlocked := func(site, user string, status engine.FlagStatus, ttl time.Duration) error {
-		req := engine.FlagRequest{Flag: engine.Blocked, Locator: store.Locator{SiteID: site}, UserID: user, Update: status,
-			TTL: ttl}
-		_, err := b.Flag(req)
-		return err
-	}
-
-	toBlocked := func(inp []interface{}) (res []store.BlockedUser) {
-		res = make([]store.BlockedUser, len(inp))
-		for i, v := range inp {
-			vv, ok := v.(store.BlockedUser)
-			require.True(t, ok)
-			res[i] = vv
+	synctest.Test(t, func(t *testing.T) {
+		b := prepMem(t)
+		setBlocked := func(site, user string, status engine.FlagStatus, ttl time.Duration) error {
+			req := engine.FlagRequest{Flag: engine.Blocked, Locator: store.Locator{SiteID: site}, UserID: user, Update: status,
+				TTL: ttl}
+			_, err := b.Flag(req)
+			return err
 		}
-		return res
-	}
-	assert.NoError(t, setBlocked("radio-t", "user1", engine.FlagTrue, 0))
-	assert.NoError(t, setBlocked("radio-t", "user2", engine.FlagTrue, 50*time.Millisecond))
-	assert.NoError(t, setBlocked("radio-t", "user3", engine.FlagFalse, 0))
 
-	vv, err := b.ListFlags(engine.FlagRequest{Flag: engine.Blocked, Locator: store.Locator{SiteID: "radio-t"}})
-	assert.NoError(t, err)
+		toBlocked := func(inp []any) (res []store.BlockedUser) {
+			res = make([]store.BlockedUser, len(inp))
+			for i, v := range inp {
+				vv, ok := v.(store.BlockedUser)
+				require.True(t, ok)
+				res[i] = vv
+			}
+			return res
+		}
+		assert.NoError(t, setBlocked("radio-t", "user1", engine.FlagTrue, 0))
+		assert.NoError(t, setBlocked("radio-t", "user2", engine.FlagTrue, 50*time.Millisecond))
+		assert.NoError(t, setBlocked("radio-t", "user3", engine.FlagFalse, 0))
 
-	blockedList := toBlocked(vv)
-	var blockedIds = make([]string, len(blockedList))
-	for i, x := range blockedList {
-		blockedIds[i] = x.ID
-	}
-	require.Equal(t, 2, len(blockedList), b.metaUsers)
-	assert.ElementsMatch(t, []string{"user1", "user2"}, blockedIds)
-	t.Logf("%+v", blockedList)
+		vv, err := b.ListFlags(engine.FlagRequest{Flag: engine.Blocked, Locator: store.Locator{SiteID: "radio-t"}})
+		assert.NoError(t, err)
 
-	// check block expiration
-	time.Sleep(50 * time.Millisecond)
-	vv, err = b.ListFlags(engine.FlagRequest{Flag: engine.Blocked, Locator: store.Locator{SiteID: "radio-t"}})
-	assert.NoError(t, err)
-	blockedList = toBlocked(vv)
-	require.Equal(t, 1, len(blockedList))
-	assert.Equal(t, "user1", blockedList[0].ID)
+		blockedList := toBlocked(vv)
+		var blockedIDs = make([]string, len(blockedList))
+		for i, x := range blockedList {
+			blockedIDs[i] = x.ID
+		}
+		require.Equal(t, 2, len(blockedList), b.metaUsers)
+		assert.ElementsMatch(t, []string{"user1", "user2"}, blockedIDs)
+		t.Logf("%+v", blockedList)
 
-	vv, err = b.ListFlags(engine.FlagRequest{Flag: engine.Blocked, Locator: store.Locator{SiteID: "bad"}})
-	assert.NoError(t, err)
-	assert.Equal(t, 0, len(vv))
+		// check block expiration
+		time.Sleep(50 * time.Millisecond)
+		vv, err = b.ListFlags(engine.FlagRequest{Flag: engine.Blocked, Locator: store.Locator{SiteID: "radio-t"}})
+		assert.NoError(t, err)
+		blockedList = toBlocked(vv)
+		require.Equal(t, 1, len(blockedList))
+		assert.Equal(t, "user1", blockedList[0].ID)
+
+		vv, err = b.ListFlags(engine.FlagRequest{Flag: engine.Blocked, Locator: store.Locator{SiteID: "bad"}})
+		assert.NoError(t, err)
+		assert.Equal(t, 0, len(vv))
+	})
 }
 
 func TestMemData_DeleteComment(t *testing.T) {
@@ -624,6 +626,7 @@ func TestMemData_DeleteComment(t *testing.T) {
 func TestMemData_Close(t *testing.T) {
 	b := prepMem(t)
 	assert.NoError(t, b.Close())
+	assert.NoError(t, b.Close(), "second call should not result in panic or errors")
 }
 
 func TestMemData_DeleteHard(t *testing.T) {
@@ -658,12 +661,40 @@ func TestMemData_DeleteAll(t *testing.T) {
 	assert.Equal(t, 0, len(comments), "nothing left")
 }
 
+func TestMemData_UserDetailAll(t *testing.T) {
+	b := prepMem(t)
+
+	val, err := b.UserDetail(engine.UserDetailRequest{Locator: store.Locator{SiteID: "test-site"}, Detail: engine.AllUserDetails})
+	require.NoError(t, err)
+	require.Nil(t, val)
+}
+
+func TestMemData_UserDetailErrors(t *testing.T) {
+	b := prepMem(t)
+
+	val, err := b.UserDetail(engine.UserDetailRequest{Locator: store.Locator{SiteID: "test-site"}, Detail: engine.UserEmail, Update: "value1"})
+	require.EqualError(t, err, "userid cannot be empty in request for single detail")
+	require.Nil(t, val)
+
+	val, err = b.UserDetail(engine.UserDetailRequest{Locator: store.Locator{SiteID: "test-site"}, Detail: engine.AllUserDetails, Update: "value1"})
+	require.EqualError(t, err, "unsupported request with userdetail all")
+	require.Nil(t, val)
+
+	val, err = b.UserDetail(engine.UserDetailRequest{Locator: store.Locator{SiteID: "test-site"}, Detail: "bad"})
+	require.EqualError(t, err, "unsupported detail \"bad\"")
+	require.Nil(t, val)
+}
+
 func TestMemData_DeleteUserDetail(t *testing.T) {
 	var (
-		createUser = engine.UserDetailRequest{Locator: store.Locator{SiteID: "test-site"}, UserID: "user1", Detail: engine.UserEmail, Update: "value1"}
-		readUser   = engine.UserDetailRequest{Locator: store.Locator{SiteID: "test-site"}, UserID: "user1", Detail: engine.UserEmail}
-		emailSet   = []engine.UserDetailEntry{{UserID: "user1", Email: "value1"}}
-		emailUnset = []engine.UserDetailEntry{{UserID: "user1", Email: ""}}
+		createEmailUser    = engine.UserDetailRequest{Locator: store.Locator{SiteID: "test-site"}, UserID: "user1", Detail: engine.UserEmail, Update: "value1"}
+		readEmailUser      = engine.UserDetailRequest{Locator: store.Locator{SiteID: "test-site"}, UserID: "user1", Detail: engine.UserEmail}
+		createTelegramUser = engine.UserDetailRequest{Locator: store.Locator{SiteID: "test-site"}, UserID: "user1", Detail: engine.UserTelegram, Update: "value1"}
+		readTelegramUser   = engine.UserDetailRequest{Locator: store.Locator{SiteID: "test-site"}, UserID: "user1", Detail: engine.UserTelegram}
+		emailSet           = []engine.UserDetailEntry{{UserID: "user1", Email: "value1"}}
+		emailUnset         = []engine.UserDetailEntry{{UserID: "user1", Email: ""}}
+		telegramSet        = []engine.UserDetailEntry{{UserID: "user1", Telegram: "value1"}}
+		telegramUnset      = []engine.UserDetailEntry{{UserID: "user1", Telegram: ""}}
 	)
 
 	b := prepMem(t)
@@ -674,15 +705,21 @@ func TestMemData_DeleteUserDetail(t *testing.T) {
 		expected  []engine.UserDetailEntry
 	}{
 		{delReq: engine.DeleteRequest{Locator: store.Locator{SiteID: "test-site"}, UserID: "user1", UserDetail: engine.UserEmail},
-			detailReq: createUser, expected: emailSet},
+			detailReq: createEmailUser, expected: emailSet},
 		{delReq: engine.DeleteRequest{Locator: store.Locator{SiteID: "bad"}, UserID: "user1", UserDetail: engine.UserEmail},
-			detailReq: readUser, expected: emailSet},
+			detailReq: readEmailUser, expected: emailSet},
 		{delReq: engine.DeleteRequest{Locator: store.Locator{SiteID: "test-site"}, UserID: "user1", UserDetail: engine.UserEmail},
-			detailReq: readUser, expected: emailUnset},
+			detailReq: readEmailUser, expected: emailUnset},
+		{delReq: engine.DeleteRequest{Locator: store.Locator{SiteID: "test-site"}, UserID: "user1", UserDetail: engine.UserTelegram},
+			detailReq: createTelegramUser, expected: telegramSet},
+		{delReq: engine.DeleteRequest{Locator: store.Locator{SiteID: "bad"}, UserID: "user1", UserDetail: engine.UserTelegram},
+			detailReq: readTelegramUser, expected: telegramSet},
+		{delReq: engine.DeleteRequest{Locator: store.Locator{SiteID: "test-site"}, UserID: "user1", UserDetail: engine.UserTelegram},
+			detailReq: readTelegramUser, expected: telegramUnset},
 		{delReq: engine.DeleteRequest{Locator: store.Locator{SiteID: "test-site"}, UserID: "user1", UserDetail: engine.AllUserDetails},
-			detailReq: createUser, expected: emailSet},
+			detailReq: createEmailUser, expected: emailSet},
 		{delReq: engine.DeleteRequest{Locator: store.Locator{SiteID: "test-site"}, UserID: "user1", UserDetail: engine.AllUserDetails},
-			detailReq: readUser, expected: emailUnset},
+			detailReq: readEmailUser, expected: emailUnset},
 	}
 
 	for i, x := range testData {
@@ -782,4 +819,27 @@ func getReq(locator store.Locator, commentID string) engine.GetRequest {
 		Locator:   locator,
 		CommentID: commentID,
 	}
+}
+
+func TestMemData_FlagsKeepUserMeta(t *testing.T) {
+	b := prepMem(t)
+	loc := store.Locator{SiteID: "radio-t"}
+
+	_, err := b.UserDetail(engine.UserDetailRequest{Detail: engine.UserEmail, Locator: loc, UserID: "u1", Update: "u1@example.com"})
+	require.NoError(t, err)
+	_, err = b.Flag(engine.FlagRequest{Flag: engine.Blocked, Locator: loc, UserID: "u1", Update: engine.FlagTrue})
+	require.NoError(t, err)
+
+	verified, err := b.ListFlags(engine.FlagRequest{Flag: engine.Verified, Locator: loc})
+	require.NoError(t, err)
+	assert.Empty(t, verified, "a blocked user with an email is not listed as verified")
+
+	_, err = b.Flag(engine.FlagRequest{Flag: engine.Verified, Locator: loc, UserID: "u1", Update: engine.FlagTrue})
+	require.NoError(t, err)
+	blocked, err := b.Flag(engine.FlagRequest{Flag: engine.Blocked, Locator: loc, UserID: "u1"})
+	require.NoError(t, err)
+	assert.True(t, blocked, "verifying a user keeps the block")
+	email, err := b.UserDetail(engine.UserDetailRequest{Detail: engine.UserEmail, Locator: loc, UserID: "u1"})
+	require.NoError(t, err)
+	assert.Equal(t, []engine.UserDetailEntry{{UserID: "u1", Email: "u1@example.com"}}, email, "flag changes keep the email")
 }

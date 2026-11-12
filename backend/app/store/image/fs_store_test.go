@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"path"
+	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"testing"
@@ -40,7 +41,7 @@ const gopher = "iVBORw0KGgoAAAANSUhEUgAAAEsAAAA8CAAAAAALAhhPAAAFfUlEQVRYw62XeWwU
 
 func gopherPNG() io.Reader { return base64.NewDecoder(base64.StdEncoding, strings.NewReader(gopher)) }
 func gopherPNGBytes() []byte {
-	img, _ := ioutil.ReadAll(gopherPNG())
+	img, _ := io.ReadAll(gopherPNG())
 	return img
 }
 
@@ -53,7 +54,7 @@ func TestFsStore_Save(t *testing.T) {
 	assert.NoError(t, err)
 
 	img := svc.location(svc.Staging, id)
-	data, err := ioutil.ReadFile(img)
+	data, err := os.ReadFile(img)
 	assert.NoError(t, err)
 	assert.Equal(t, 1462, len(data))
 }
@@ -65,7 +66,7 @@ func TestFsStore_SaveNoResizeJpeg(t *testing.T) {
 	fh, err := os.Open("testdata/circles.jpg")
 	defer func() { assert.NoError(t, fh.Close()) }()
 	assert.NoError(t, err)
-	img, err := ioutil.ReadAll(fh)
+	img, err := io.ReadAll(fh)
 	assert.NoError(t, err)
 	id := "test_img"
 	err = svc.Save(id, img)
@@ -73,9 +74,9 @@ func TestFsStore_SaveNoResizeJpeg(t *testing.T) {
 
 	imgPath := svc.location(svc.Staging, id)
 	t.Log(imgPath)
-	data, err := ioutil.ReadFile(imgPath)
+	data, err := os.ReadFile(imgPath)
 	assert.NoError(t, err)
-	assert.Equal(t, 23983, len(data))
+	assert.Equal(t, 16756, len(data))
 }
 
 func TestFsStore_SaveAndCommit(t *testing.T) {
@@ -94,13 +95,12 @@ func TestFsStore_SaveAndCommit(t *testing.T) {
 
 	img := svc.location(svc.Location, id)
 	t.Log(img)
-	data, err := ioutil.ReadFile(img)
+	data, err := os.ReadFile(img)
 	assert.NoError(t, err)
 	assert.Equal(t, 1462, len(data))
 }
 
 func TestFsStore_LoadAfterSave(t *testing.T) {
-
 	svc, teardown := prepareImageTest(t)
 	defer teardown()
 
@@ -117,7 +117,6 @@ func TestFsStore_LoadAfterSave(t *testing.T) {
 }
 
 func TestFsStore_LoadAfterCommit(t *testing.T) {
-
 	svc, teardown := prepareImageTest(t)
 	defer teardown()
 
@@ -132,6 +131,85 @@ func TestFsStore_LoadAfterCommit(t *testing.T) {
 	assert.Equal(t, 1462, len(data))
 	_, err = svc.Load("abcd")
 	assert.Error(t, err)
+}
+
+func TestFsStore_LoadAfterDelete(t *testing.T) {
+	svc, teardown := prepareImageTest(t)
+	defer teardown()
+
+	id := "test_img"
+	err := svc.Save(id, gopherPNGBytes())
+	assert.NoError(t, err)
+	err = svc.Commit(id)
+	require.NoError(t, err)
+	err = svc.Delete(id)
+	require.NoError(t, err)
+
+	_, err = svc.Load(id)
+	assert.Error(t, err)
+
+	// create file on staging
+	err = svc.Save(id, gopherPNGBytes())
+	assert.NoError(t, err)
+	err = svc.Delete(id)
+	require.NoError(t, err)
+
+	_, err = svc.Load(id)
+	assert.Error(t, err)
+}
+
+func TestFsStore_LoadClosesFile(t *testing.T) {
+	if _, err := os.Stat("/dev/fd"); err != nil {
+		t.Skip("no /dev/fd to count open files")
+	}
+	svc, teardown := prepareImageTest(t)
+	defer teardown()
+	require.NoError(t, svc.Save("user1/test_img", gopherPNGBytes()))
+
+	// gc stays off so the os.File finalizer can't close a handle Load leaked
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	openFiles := func() int {
+		entries, err := os.ReadDir("/dev/fd")
+		require.NoError(t, err)
+		return len(entries)
+	}
+	before := openFiles()
+	for range 50 {
+		_, err := svc.Load("user1/test_img")
+		require.NoError(t, err)
+	}
+	assert.Less(t, openFiles()-before, 5)
+}
+
+func TestFsStore_RejectsUnsafeID(t *testing.T) {
+	ids := []string{"../remark.db", "../..", "user/..", "./remark.db", "/remark.db", "user/", "", "a/b/c",
+		"../a/remark.db", `..\remark.db`, "user/pic\x00.png"}
+	for _, partitions := range []int{0, 100} {
+		t.Run(strconv.Itoa(partitions), func(t *testing.T) {
+			root := t.TempDir()
+			svc := &FileSystem{Location: filepath.Join(root, "pictures"), Staging: filepath.Join(root, "pictures.staging"),
+				Partitions: partitions}
+			db := filepath.Join(root, "remark.db")
+			require.NoError(t, os.WriteFile(db, []byte("db"), 0o600))
+
+			for _, id := range ids {
+				assert.Error(t, svc.Save(id, gopherPNGBytes()), "save %q", id)
+				_, err := svc.Load(id)
+				assert.Error(t, err, "load %q", id)
+				assert.Error(t, svc.ResetCleanupTimer(id), "reset cleanup timer %q", id)
+				assert.Error(t, svc.Commit(id), "commit %q", id)
+				assert.Error(t, svc.Delete(id), "delete %q", id)
+			}
+
+			data, err := os.ReadFile(db)
+			require.NoError(t, err)
+			assert.Equal(t, "db", string(data))
+			entries, err := os.ReadDir(root)
+			require.NoError(t, err)
+			require.Len(t, entries, 1, "nothing created next to the image directories")
+			assert.Equal(t, "remark.db", entries[0].Name())
+		})
+	}
 }
 
 func TestFsStore_location(t *testing.T) {
@@ -151,7 +229,6 @@ func TestFsStore_location(t *testing.T) {
 		{0, "user/12345", "/tmp/user/12345"},
 	}
 	for n, tt := range tbl {
-		tt := tt
 		t.Run(strconv.Itoa(n), func(t *testing.T) {
 			svc := FileSystem{Location: "/tmp", Partitions: tt.partitions}
 			assert.Equal(t, tt.res, svc.location("/tmp", tt.id))
@@ -169,7 +246,7 @@ func TestFsStore_location(t *testing.T) {
 	}
 
 	svc := FileSystem{Location: "/tmp", Partitions: 10}
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		v := randomID(rand.Intn(64))
 		location := svc.location("/tmp", v)
 		elems := strings.Split(location, "/")
@@ -183,26 +260,35 @@ func TestFsStore_Cleanup(t *testing.T) {
 	svc, teardown := prepareImageTest(t)
 	defer teardown()
 
-	save := func(file string, user string) (filePath string) {
+	save := func(file, user string) (filePath string) {
 		id := path.Join(user, file)
 		err := svc.Save(id, gopherPNGBytes())
 		require.NoError(t, err)
 		img := svc.location(svc.Staging, id)
-		data, err := ioutil.ReadFile(img)
+		data, err := os.ReadFile(img)
 		require.NoError(t, err)
 		assert.Equal(t, 1462, len(data))
 		return img
 	}
 
+	// age is read from the file's modification time, so every file gets its mtime stamped right
+	// before each call: far past the ttl for the ones meant to go, at now for the ones meant to
+	// survive, leaving no window for a stalled runner to age a survivor into the wrong bucket
+	const ttl = 300 * time.Millisecond
+	age := func(file string, d time.Duration) {
+		mtime := time.Now().Add(-d)
+		require.NoError(t, os.Chtimes(file, mtime, mtime))
+	}
+
 	// save 3 images to staging
 	img1 := save("blah_ff1.png", "user1")
-	time.Sleep(100 * time.Millisecond)
 	img2 := save("blah_ff2.png", "user1")
-	time.Sleep(100 * time.Millisecond)
 	img3 := save("blah_ff3.png", "user2")
 
-	time.Sleep(200 * time.Millisecond) // make first image expired
-	err := svc.Cleanup(context.Background(), time.Millisecond*300)
+	age(img1, time.Hour) // past the ttl, collected
+	age(img2, 0)         // fresh, survives
+	age(img3, 0)
+	err := svc.Cleanup(context.Background(), ttl)
 	assert.NoError(t, err)
 
 	_, err = os.Stat(img1)
@@ -221,14 +307,20 @@ func TestFsStore_Cleanup(t *testing.T) {
 	_, err = os.Stat(img3)
 	assert.NoError(t, err, "file on staging")
 
-	time.Sleep(200 * time.Millisecond) // make all images expired
-	err = svc.Cleanup(context.Background(), time.Millisecond*300)
+	age(img2, time.Hour)
+	age(img3, time.Hour)
+	err = svc.ResetCleanupTimer("user2/blah_ff3.png") // reset the time to cleanup for third image
+	assert.NoError(t, err)
+	err = svc.Cleanup(context.Background(), ttl)
 	assert.NoError(t, err)
 
 	_, err = os.Stat(img2)
 	assert.Error(t, err, "no file on staging anymore")
 	_, err = os.Stat(img3)
-	assert.Error(t, err, "no file on staging anymore")
+	assert.NoError(t, err, "third image is still on staging because its cleanup timer was reset")
+
+	err = svc.ResetCleanupTimer("unknown_image.png")
+	assert.Error(t, err)
 }
 
 func TestFsStore_Info(t *testing.T) {
@@ -251,10 +343,10 @@ func TestFsStore_Info(t *testing.T) {
 }
 
 func prepareImageTest(t *testing.T) (svc *FileSystem, teardown func()) {
-	loc, err := ioutil.TempDir("", "test_image_r42")
+	loc, err := os.MkdirTemp("", "test_image_r42")
 	require.NoError(t, err, "failed to make temp dir")
 
-	staging, err := ioutil.TempDir("", "test_image_r42.staging")
+	staging, err := os.MkdirTemp("", "test_image_r42.staging")
 	require.NoError(t, err, "failed to make temp staging dir")
 
 	svc = &FileSystem{

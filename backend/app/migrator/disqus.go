@@ -2,12 +2,13 @@ package migrator
 
 import (
 	"encoding/xml"
+	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"time"
 
 	log "github.com/go-pkgz/lgr"
-	"github.com/pkg/errors"
 
 	"github.com/umputun/remark42/backend/app/store"
 )
@@ -44,6 +45,7 @@ type disqusComment struct {
 	Tid            uid       `xml:"thread"`
 	Pid            uid       `xml:"parent"`
 	IsSpam         bool      `xml:"isSpam"`
+	Deleted        bool      `xml:"isDeleted"`
 }
 
 type uid struct {
@@ -52,114 +54,120 @@ type uid struct {
 
 // Import from disqus and save to store
 func (d *Disqus) Import(r io.Reader, siteID string) (size int, err error) {
-	if e := d.DataStore.DeleteAll(siteID); e != nil {
-		return 0, e
-	}
-
-	commentsCh := d.convert(r, siteID)
-	failed, passed := 0, 0
-	for c := range commentsCh {
-		if _, err = d.DataStore.Create(c); err != nil {
-			failed++
-			continue
-		}
-		passed++
-	}
-
-	if failed > 0 {
-		err = errors.Errorf("failed to save %d comments", failed)
-		if passed == 0 {
-			err = errors.New("import failed")
-		}
-	}
-
-	log.Printf("[DEBUG] imported %d comments to site %s", passed, siteID)
-
-	return passed, err
+	return importComments(d.DataStore, r, siteID, d.convert)
 }
 
-// convert disqus stream (xml) from reader and fill channel of comments.
-// runs async and closes channel on completion.
-func (d *Disqus) convert(r io.Reader, siteID string) (ch chan store.Comment) {
-
+// convert reads disqus export (xml) from r and passes each comment to emit
+func (d *Disqus) convert(r io.Reader, siteID string, emit func(store.Comment) error) error {
 	postsMap := map[string]string{} // tid:url
 	decoder := xml.NewDecoder(r)
-	commentsCh := make(chan store.Comment)
 
 	stats := struct {
-		inpThreads, inpComments     int
-		commentsCount, spamComments int
-		failedThreads, failedPosts  int
+		inpThreads, inpComments          int
+		commentsCount, spamComments      int
+		failedThreads, failedPosts       int
+		deletedComments, skippedComments int
 	}{}
 
-	go func() {
-		for {
-			t, err := decoder.Token()
-			if t == nil || err != nil {
-				break
+	rootSeen := false
+	for {
+		t, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("can't read disqus export: %w", err)
+		}
+		if se, ok := t.(xml.StartElement); ok && !rootSeen {
+			if se.Name.Local != "disqus" {
+				return fmt.Errorf("not a disqus export, the root element is <%s>", se.Name.Local)
 			}
+			rootSeen = true
+			continue
+		}
 
-			switch se := t.(type) {
-			case xml.StartElement:
-				if se.Name.Local == "thread" {
-					stats.inpThreads++
-					thread := disqusThread{}
-					if err = decoder.DecodeElement(&thread, &se); err != nil {
-						log.Printf("[WARN] can't decode disqus thread, %s", err)
-						stats.failedThreads++
-						continue
-					}
-					postsMap[thread.UID] = thread.Link
+		if se, ok := t.(xml.StartElement); ok {
+			if se.Name.Local == "thread" {
+				stats.inpThreads++
+				thread := disqusThread{}
+				if err = decoder.DecodeElement(&thread, &se); err != nil {
+					log.Printf("[WARN] can't decode disqus thread, %s", err)
+					stats.failedThreads++
 					continue
 				}
-				if se.Name.Local == "post" {
-					stats.inpComments++
-					comment := disqusComment{}
-					if err = decoder.DecodeElement(&comment, &se); err != nil {
-						log.Printf("[WARN] can't decode disqus comment, %s", err)
-						stats.failedPosts++
-						continue
-					}
-					if comment.IsSpam {
-						stats.spamComments++
-						continue
-					}
-					c := store.Comment{
-						ID:      comment.UID,
-						Locator: store.Locator{URL: postsMap[comment.Tid.Val], SiteID: siteID},
-						User: store.User{
-							ID:   "disqus_" + store.EncodeID(comment.AuthorUserName),
-							Name: comment.AuthorName,
-							IP:   comment.IP,
-						},
-						Text:      d.cleanText(comment.Message),
-						Timestamp: comment.CreatedAt,
-						ParentID:  comment.Pid.Val,
-						Imported:  true,
-					}
-					if comment.AuthorUserName == "" { // empty comment.AuthorUserName from disqus
-						c.User.ID = "disqus_" + store.EncodeID(c.User.Name)
-					}
-					if c.ID == "" { // no comment.UID
-						c.ID = comment.ID
-					}
-					commentsCh <- c
-					stats.commentsCount++
-					if stats.commentsCount%1000 == 0 {
-						log.Printf("[DEBUG] processed %d comments", stats.commentsCount)
-					}
+				if thread.Deleted {
+					continue
+				}
+				postsMap[thread.UID] = thread.Link
+				continue
+			}
+
+			if se.Name.Local == "post" {
+				stats.inpComments++
+				comment := disqusComment{}
+				if err = decoder.DecodeElement(&comment, &se); err != nil {
+					log.Printf("[WARN] can't decode disqus comment, %s", err)
+					stats.failedPosts++
+					continue
+				}
+				if comment.Deleted {
+					stats.deletedComments++
+					continue
+				}
+				if comment.IsSpam {
+					stats.spamComments++
+					continue
+				}
+
+				url, ok := postsMap[comment.Tid.Val]
+				if !ok {
+					stats.skippedComments++
+					continue
+				}
+
+				c := store.Comment{
+					ID:      comment.UID,
+					Locator: store.Locator{URL: url, SiteID: siteID},
+					User: store.User{
+						ID:   "disqus_" + store.EncodeID(comment.AuthorUserName),
+						Name: comment.AuthorName,
+						IP:   comment.IP,
+					},
+					Text:      d.cleanText(comment.Message),
+					Timestamp: comment.CreatedAt,
+					ParentID:  comment.Pid.Val,
+					Imported:  true,
+				}
+				if comment.AuthorUserName == "" { // empty comment.AuthorUserName from disqus
+					c.User.ID = "disqus_" + store.EncodeID(c.User.Name)
+				}
+				if c.ID == "" { // no comment.UID
+					c.ID = comment.ID
+				}
+				if err := emit(c); err != nil {
+					return err
+				}
+				stats.commentsCount++
+				if stats.commentsCount%1000 == 0 {
+					log.Printf("[DEBUG] processed %d comments", stats.commentsCount)
 				}
 			}
 		}
-		close(commentsCh)
-		log.Printf("[INFO] converted %d posts, %+v", len(postsMap), stats)
-	}()
-
-	return commentsCh
+	}
+	if !rootSeen {
+		return fmt.Errorf("not a disqus export, no <disqus> element found")
+	}
+	if stats.commentsCount == 0 && (stats.failedPosts > 0 || stats.failedThreads > 0) {
+		return fmt.Errorf("no comments could be read from the disqus export, %d threads and %d posts failed to decode",
+			stats.failedThreads, stats.failedPosts)
+	}
+	log.Printf("[INFO] converted %d posts, %+v", len(postsMap), stats)
+	return nil
 }
 
 func (*Disqus) cleanText(text string) string {
-	text = strings.Replace(text, "\n", "", -1)
-	text = strings.Replace(text, "\t", "", -1)
+	text = strings.TrimSpace(text)
+	text = strings.ReplaceAll(text, "\n", "")
+	text = strings.ReplaceAll(text, "\t", "")
 	return text
 }

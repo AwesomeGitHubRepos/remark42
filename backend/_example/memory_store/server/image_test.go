@@ -11,7 +11,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strings"
 	"testing"
@@ -46,7 +45,7 @@ const gopher = "iVBORw0KGgoAAAANSUhEUgAAAEsAAAA8CAAAAAALAhhPAAAFfUlEQVRYw62XeWwU
 
 func gopherPNG() io.Reader { return base64.NewDecoder(base64.StdEncoding, strings.NewReader(gopher)) }
 func gopherPNGBytes() []byte {
-	img, _ := ioutil.ReadAll(gopherPNG())
+	img, _ := io.ReadAll(gopherPNG())
 	return img
 }
 
@@ -116,7 +115,24 @@ func TestRPC_imgCleanupHndl(t *testing.T) {
 	assert.Equal(t, 1462, len(img))
 	assert.Equal(t, gopherPNGBytes(), img)
 
-	// cleanup
+	// age the image past the ttl used below, so the reset that follows is what keeps it on
+	// staging rather than the image simply being young
+	const stagingTTL = 500 * time.Millisecond
+	time.Sleep(stagingTTL + 100*time.Millisecond)
+
+	// reset the time to cleanup, which leaves a full ttl before it could be collected again
+	err = ri.ResetCleanupTimer(id)
+	assert.NoError(t, err)
+
+	// cleanup, should not affect the new image
+	err = ri.Cleanup(context.TODO(), stagingTTL)
+	assert.NoError(t, err)
+
+	// load after cleanup should succeed
+	_, err = ri.Load(id)
+	assert.NoError(t, err, "image is still on staging because it's cleanup timer was reset")
+
+	// cleanup with short TTL, should remove the image from staging
 	err = ri.Cleanup(context.TODO(), time.Nanosecond)
 	assert.NoError(t, err)
 
@@ -145,4 +161,9 @@ func TestRPC_imgInfoHndl(t *testing.T) {
 	info, err = ri.Info()
 	assert.NoError(t, err)
 	assert.False(t, info.FirstStagingImageTS.IsZero())
+
+	err = ri.Delete("test_img")
+	assert.NoError(t, err)
+	_, err = ri.Load("test_img")
+	assert.EqualError(t, err, "image test_img not found")
 }

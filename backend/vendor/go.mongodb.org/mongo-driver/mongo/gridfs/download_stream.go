@@ -58,7 +58,8 @@ type File struct {
 	// ChunkSize is the maximum number of bytes for each chunk in this file.
 	ChunkSize int32
 
-	// UploadDate is the time this file was added to GridFS in UTC.
+	// UploadDate is the time this file was added to GridFS in UTC. This field is set by the driver and is not configurable.
+	// The Metadata field can be used to store a custom date.
 	UploadDate time.Time
 
 	// Name is the name of this file.
@@ -83,6 +84,8 @@ type unmarshalFile struct {
 }
 
 // UnmarshalBSON implements the bson.Unmarshaler interface.
+//
+// Deprecated: Unmarshaling a File from BSON will not be supported in Go Driver 2.0.
 func (f *File) UnmarshalBSON(data []byte) error {
 	var temp unmarshalFile
 	if err := bson.Unmarshal(data, &temp); err != nil {
@@ -119,6 +122,9 @@ func (ds *DownloadStream) Close() error {
 	}
 
 	ds.closed = true
+	if ds.cursor != nil {
+		return ds.cursor.Close(context.Background())
+	}
 	return nil
 }
 
@@ -154,7 +160,7 @@ func (ds *DownloadStream) Read(p []byte) (int, error) {
 			// Buffer is empty and can load in data from new chunk.
 			err = ds.fillBuffer(ctx)
 			if err != nil {
-				if err == errNoMoreChunks {
+				if errors.Is(err, errNoMoreChunks) {
 					if bytesCopied == 0 {
 						ds.done = true
 						return 0, io.EOF
@@ -193,29 +199,26 @@ func (ds *DownloadStream) Skip(skip int64) (int64, error) {
 	var err error
 
 	for skipped < skip {
-		if ds.bufferStart == 0 {
+		if ds.bufferStart >= ds.bufferEnd {
+			// Buffer is empty and can load in data from new chunk.
 			err = ds.fillBuffer(ctx)
 			if err != nil {
-				if err == errNoMoreChunks {
+				if errors.Is(err, errNoMoreChunks) {
 					return skipped, nil
 				}
-
 				return skipped, err
 			}
 		}
 
-		// try to skip whole chunk if possible
-		toSkip := 0
-		if skip-skipped < int64(len(ds.buffer)) {
-			// can skip whole chunk
-			toSkip = len(ds.buffer)
-		} else {
-			// can only skip part of buffer
-			toSkip = int(skip - skipped)
+		toSkip := skip - skipped
+		// Cap the amount to skip to the remaining bytes in the buffer to be consumed.
+		bufferRemaining := ds.bufferEnd - ds.bufferStart
+		if toSkip > int64(bufferRemaining) {
+			toSkip = int64(bufferRemaining)
 		}
 
-		skipped += int64(toSkip)
-		ds.bufferStart = (ds.bufferStart + toSkip) % (int(ds.chunkSize))
+		skipped += toSkip
+		ds.bufferStart += int(toSkip)
 	}
 
 	return skip, nil
@@ -229,6 +232,16 @@ func (ds *DownloadStream) GetFile() *File {
 func (ds *DownloadStream) fillBuffer(ctx context.Context) error {
 	if !ds.cursor.Next(ctx) {
 		ds.done = true
+		// Check for cursor error, otherwise there are no more chunks.
+		if ds.cursor.Err() != nil {
+			_ = ds.cursor.Close(ctx)
+			return ds.cursor.Err()
+		}
+		// If there are no more chunks, but we didn't read the expected number of chunks, return an
+		// ErrWrongIndex error to indicate that we're missing chunks at the end of the file.
+		if ds.expectedChunk != ds.numChunks {
+			return ErrWrongIndex
+		}
 		return errNoMoreChunks
 	}
 
@@ -237,7 +250,14 @@ func (ds *DownloadStream) fillBuffer(ctx context.Context) error {
 		return err
 	}
 
-	if chunkIndex.Int32() != ds.expectedChunk {
+	var chunkIndexInt32 int32
+	if chunkIndexInt64, ok := chunkIndex.Int64OK(); ok {
+		chunkIndexInt32 = int32(chunkIndexInt64)
+	} else {
+		chunkIndexInt32 = chunkIndex.Int32()
+	}
+
+	if chunkIndexInt32 != ds.expectedChunk {
 		return ErrWrongIndex
 	}
 
@@ -254,7 +274,7 @@ func (ds *DownloadStream) fillBuffer(ctx context.Context) error {
 	if ds.expectedChunk == ds.numChunks {
 		// final chunk can be fewer than ds.chunkSize bytes
 		bytesDownloaded := int64(ds.chunkSize) * (int64(ds.expectedChunk) - int64(1))
-		bytesRemaining := ds.fileLen - int64(bytesDownloaded)
+		bytesRemaining := ds.fileLen - bytesDownloaded
 
 		if int64(bytesLen) != bytesRemaining {
 			return ErrWrongSize

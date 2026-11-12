@@ -1,25 +1,22 @@
 package rest
 
 import (
-	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/go-pkgz/auth/v2/token"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/umputun/remark42/backend/app/store"
 )
 
 func TestSendErrorJSON(t *testing.T) {
-
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/error" {
 			t.Log("http err request", r.URL)
-			SendErrorJSON(w, r, 500, errors.New("error 500"), "error details 123456", 123)
+			SendErrorJSON(w, r, 500, fmt.Errorf("error 500"), "error details 123456", 123)
 			return
 		}
 		w.WriteHeader(404)
@@ -31,25 +28,18 @@ func TestSendErrorJSON(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	assert.Equal(t, 500, resp.StatusCode)
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 
 	assert.Equal(t, `{"code":123,"details":"error details 123456","error":"error 500"}`+"\n", string(body))
 }
 
-type MockFS struct{}
-
-func (fs *MockFS) ReadFile(path string) ([]byte, error) {
-	return []byte(fmt.Sprintf("{{.Error}}{{.Details}} %s", path)), nil
-}
-
 func TestSendErrorHTML(t *testing.T) {
-	fs := &MockFS{}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/error" {
 			t.Log("http err request", r.URL)
-			SendErrorHTML(w, r, 500, errors.New("error 500"), "error details 123456", 987, fs)
+			SendErrorHTML(w, r, 500, fmt.Errorf("error 500"), "error details 123456", 987)
 			return
 		}
 		w.WriteHeader(404)
@@ -61,9 +51,9 @@ func TestSendErrorHTML(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	assert.Equal(t, 500, resp.StatusCode)
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 
 	assert.NotContains(t, string(body), `987`, "user html should not contain internal error code")
 	assert.Contains(t, string(body), `error details 123456`)
@@ -72,10 +62,10 @@ func TestSendErrorHTML(t *testing.T) {
 
 func TestErrorDetailsMsg(t *testing.T) {
 	callerFn := func() {
-		req, err := http.NewRequest("GET", "https://example.com/test?k1=v1&k2=v2", nil)
+		req, err := http.NewRequest("GET", "https://example.com/test?k1=v1&k2=v2", http.NoBody)
 		require.NoError(t, err)
 		req.RemoteAddr = "1.2.3.4"
-		msg := errDetailsMsg(req, 500, errors.New("error 500"), "error details 123456", 123)
+		msg := errDetailsMsg(req, 500, fmt.Errorf("error 500"), "error details 123456", 123)
 		assert.Contains(t, msg, "error details 123456 - error 500 - 500 (123) - https://example.com/test?k1=v1&k2=v2 - [app/rest/httperrors_test.go:")
 		// error line in the middle of the message is not checked
 		assert.Contains(t, msg, " rest.TestErrorDetailsMsg]")
@@ -85,12 +75,12 @@ func TestErrorDetailsMsg(t *testing.T) {
 
 func TestErrorDetailsMsgWithUser(t *testing.T) {
 	callerFn := func() {
-		req, err := http.NewRequest("GET", "https://example.com/test?k1=v1&k2=v2", nil)
+		req, err := http.NewRequest("GET", "https://example.com/test?k1=v1&k2=v2", http.NoBody)
 		require.NoError(t, err)
 		req.RemoteAddr = "127.0.0.1:1234"
-		req = SetUserInfo(req, store.User{Name: "test", ID: "id"})
+		req = token.SetUserInfo(req, token.User{Name: "test", ID: "id"})
 		require.NoError(t, err)
-		msg := errDetailsMsg(req, 500, errors.New("error 500"), "error details 123456", 34567)
+		msg := errDetailsMsg(req, 500, fmt.Errorf("error 500"), "error details 123456", 34567)
 		assert.Contains(t, msg, "error details 123456 - error 500 - 500 (34567) - test/id - https://example.com/test?k1=v1&k2=v2 - [app/rest/httperrors_test.go:")
 		// error line in the middle of the message is not checked
 		assert.Contains(t, msg, " rest.TestErrorDetailsMsgWithUser]")

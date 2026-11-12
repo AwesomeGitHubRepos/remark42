@@ -1,0 +1,74 @@
+import 'jest-fetch-mock';
+import type { Theme } from 'common/types';
+
+type RemarkConfig = {
+  // Hostname of Remark42 server, same as REMARK_URL in backend config, e.g. "https://demo.remark42.com".
+  host?: string;
+  // The SITE that you passed to Remark42 instance on start of backend.
+  site_id: string;
+  // Optional, 'window.location.origin + window.location.pathname' by default.
+  // URL to the page with comments, it is used as unique identificator for comments thread
+  //
+  // Note that if you use query parameters as significant part of URL(the one that actually changes content on page)
+  // you will have to configure URL manually to keep query params, as 'window.location.origin + window.location.pathname'
+  // doesn't contain query params and hash. For example, default URL for 'https://example/com/example-post?id=1#hash'
+  // would be 'https://example/com/example-post'
+  url?: string;
+  // Optional, '10' by default. Initial number of top-level comments shown on mobile; each "show more" adds 10 more.
+  max_shown_comments?: number;
+  // Optional, '15' by default. Maximum number of comments in the last comments widget.
+  max_last_comments?: number;
+  // Optional, 'dark' or 'light', 'light' by default. Changes UI theme.
+  theme?: Theme;
+  // Optional, 'document.title' by default. Title for current comments page.
+  page_title?: string;
+  // Not for the host page to set. The host page's title as the embed script last posted it,
+  // kept by iframe.ejs inside the widget document.
+  host_page_title?: string;
+  // Optional, 'en' by default. Interface localization.
+  locale?: string;
+  // Optional, 'true' by default. Enables email subscription feature in interface when enable it from backend side,
+  // if you set this param in 'false' you will get notifications email notifications as admin but your users
+  // won't have interface for subscription
+  show_email_subscription?: boolean;
+  // Optional, 'true' by default. Enables telegram subscription feature in interface when enable it from backend side,
+  // if you set this param in 'false' you will get telegram notifications as admin but your users
+  // won't have interface for subscription
+  show_telegram_subscription?: boolean;
+  // Optional, 'true' by default. Enables RSS subscription feature in interface.
+  show_rss_subscription?: boolean;
+  // Optional, 'false' by default. Simplifies the comment form, hiding the formatting toolbar and the
+  // preview button; 'false' does not disable SIMPLE_VIEW enabled on the backend.
+  simple_view?: boolean;
+  // Optional, 'false' by default. Hides footer with signature and links to Remark42.
+  no_footer?: boolean;
+  // Optional. Overrides CSS custom properties on the widget's own document, e.g.
+  // { '--primary-color': '0, 100, 200', '--font-family': 'Georgia' }. Only properties the widget's
+  // own stylesheets already declare have any effect. Read once at load time (via the iframe's
+  // `window.name`), so it is not a runtime API - changing it after the widget has mounted has no
+  // effect without a reload. See the frontend configuration docs.
+  custom_properties?: Record<string, string>;
+  // @deprecated use `custom_properties` instead. The historical name from when this was
+  // presumed colors-only; it never actually was, and is merged with `custom_properties` if both
+  // are set (which wins on a key they share).
+  __colors__?: Record<string, string>;
+};
+
+declare global {
+  interface Window {
+    __REDUX_DEVTOOLS_EXTENSION_COMPOSE__?: typeof compose;
+    /** only for dev env */
+    ReduxStore: typeof store;
+    remark_config: RemarkConfig;
+    REMARK42: {
+      changeTheme?: (theme: Theme) => void;
+      destroy?: () => void;
+      createInstance: (remark_config: RemarkConfig) =>
+        | {
+            changeTheme(theme: Theme): void;
+            destroy(): void;
+          }
+        | undefined;
+    };
+  }
+}

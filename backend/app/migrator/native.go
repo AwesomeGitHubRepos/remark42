@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"slices"
 	"sync/atomic"
 
 	log "github.com/go-pkgz/lgr"
 	"github.com/go-pkgz/syncs"
-	"github.com/pkg/errors"
 
 	"github.com/umputun/remark42/backend/app/store"
 	"github.com/umputun/remark42/backend/app/store/service"
@@ -35,9 +37,8 @@ type meta struct {
 // Export all comments to writer as json strings. Each comment is one string, separated by "\n"
 // The final file is a valid json
 func (n *Native) Export(w io.Writer, siteID string) (size int, err error) {
-
 	if err = n.exportMeta(siteID, w); err != nil {
-		return 0, errors.Wrapf(err, "failed to export meta for site %s", siteID)
+		return 0, fmt.Errorf("failed to export meta for site %s: %w", siteID, err)
 	}
 
 	topics, err := n.DataStore.List(siteID, 0, 0)
@@ -47,24 +48,24 @@ func (n *Native) Export(w io.Writer, siteID string) (size int, err error) {
 
 	log.Printf("[DEBUG] exporting %d topics", len(topics))
 	commentsCount := 0
-	for i := len(topics) - 1; i >= 0; i-- { // topics from List sorted in opposite direction
-		topic := topics[i]
-		comments, e := n.DataStore.Find(store.Locator{SiteID: siteID, URL: topic.URL}, "time", adminUser)
+	for _, topic := range slices.Backward(topics) { // topics from List sorted in opposite direction
+
+		comments, e := n.DataStore.FindRaw(store.Locator{SiteID: siteID, URL: topic.URL})
 		if e != nil {
 			return commentsCount, e
 		}
 
 		for _, comment := range comments {
-
+			comment.VotedIPs = nil // voters' IP hashes stay out of backups, as before
 			buf := &bytes.Buffer{}
 			enc := json.NewEncoder(buf)
 			enc.SetEscapeHTML(false)
 
 			if err = enc.Encode(comment); err != nil {
-				return commentsCount, errors.Wrapf(err, "can't marshal %v", comments)
+				return commentsCount, fmt.Errorf("can't marshal %v: %w", comments, err)
 			}
 			if _, err = w.Write(buf.Bytes()); err != nil {
-				return commentsCount, errors.Wrap(err, "can't write comment data")
+				return commentsCount, fmt.Errorf("can't write comment data: %w", err)
 			}
 			commentsCount++
 		}
@@ -78,11 +79,11 @@ func (n *Native) exportMeta(siteID string, w io.Writer) (err error) {
 	m := meta{Version: nativeVersion}
 	m.Users, m.Posts, err = n.DataStore.Metas(siteID)
 	if err != nil {
-		return errors.Wrap(err, "can't get meta")
+		return fmt.Errorf("can't get meta: %w", err)
 	}
 
 	if err = json.NewEncoder(w).Encode(m); err != nil {
-		return errors.Wrap(err, "can't encode meta")
+		return fmt.Errorf("can't encode meta: %w", err)
 	}
 	return nil
 }
@@ -133,11 +134,11 @@ func (n *Native) Import(reader io.Reader, siteID string) (size int, err error) {
 	m := meta{}
 	dec := json.NewDecoder(reader)
 	if err = dec.Decode(&m); err != nil {
-		return 0, errors.Wrapf(err, "failed to import meta for site %s", siteID)
+		return 0, fmt.Errorf("failed to import meta for site %s: %w", siteID, err)
 	}
 
 	if m.Version != nativeVersion && m.Version != 0 { // this version allows back compatibility with 0 version
-		return 0, errors.Errorf("unexpected import file version %d", m.Version)
+		return 0, fmt.Errorf("unexpected import file version %d", m.Version)
 	}
 
 	if e := n.DataStore.DeleteAll(siteID); e != nil {
@@ -145,6 +146,7 @@ func (n *Native) Import(reader io.Reader, siteID string) (size int, err error) {
 	}
 
 	var failed, total, comments int64
+	var decodeErr error
 
 	concurrent := defaultConcurrent
 	if n.Concurrent > 0 {
@@ -153,20 +155,26 @@ func (n *Native) Import(reader io.Reader, siteID string) (size int, err error) {
 	grp := syncs.NewSizedGroup(concurrent, syncs.Preemptive)
 
 	for {
-		comment := store.Comment{}
-		err = dec.Decode(&comment)
-		comment.Imported = true
-		if err == io.EOF {
+		// read each record as raw JSON first: the decoder can't move past a syntax error or a truncated record
+		// and returns it again on every call, while a well-formed record with a wrong value is skipped below
+		var rec json.RawMessage
+		if err = dec.Decode(&rec); err != nil {
+			if err != io.EOF {
+				decodeErr = fmt.Errorf("can't decode comment after %d records: %w", total, err)
+			}
 			break
 		}
-
 		total++
-
-		if err != nil {
+		comment := store.Comment{}
+		if err = json.Unmarshal(rec, &comment); err != nil {
 			atomic.AddInt64(&failed, 1)
-			failed++
+			log.Printf("[WARN] can't decode comment record %d, %s", total, err)
 			continue
 		}
+		comment.Imported = true
+		// exports made by earlier versions stored the blocked status of the time inside comments;
+		// it is kept in the users metadata, and leaving it in the comment marks the user blocked forever
+		comment.User.Blocked = false
 
 		// write comments in parallel
 		grp.Go(func(context.Context) {
@@ -180,17 +188,20 @@ func (n *Native) Import(reader io.Reader, siteID string) (size int, err error) {
 				log.Printf("[DEBUG] imported %d comments", num)
 			}
 		})
-
 	}
 
 	grp.Wait()
-
-	if failed > 0 {
-		return int(comments), errors.Errorf("failed to save %d comments", failed)
-	}
 	log.Printf("[INFO] imported %d comments from %d records", comments, total)
 
-	err = n.DataStore.SetMetas(siteID, m.Users, m.Posts)
-
-	return int(comments), err
+	// metas are restored even when some comments failed, so blocks, verified users, read-only posts
+	// and user details are not lost because of one bad record
+	var errs []error
+	if decodeErr != nil {
+		errs = append(errs, decodeErr)
+	}
+	if failed > 0 {
+		errs = append(errs, fmt.Errorf("failed to save %d comments", failed))
+	}
+	errs = append(errs, n.DataStore.SetMetas(siteID, m.Users, m.Posts))
+	return int(comments), errors.Join(errs...)
 }

@@ -1,0 +1,177 @@
+import { h, Component } from 'preact';
+import clsx from 'clsx';
+
+import type { IntlShape } from 'common/intl';
+import { FormattedMessage, useIntl } from 'common/intl';
+import type { User, Theme, PostInfo } from 'common/types';
+import { IS_STORAGE_AVAILABLE, IS_THIRD_PARTY } from 'common/constants';
+import { postMessageToParent } from 'utils/post-message';
+import { getHandleClickProps } from 'common/accessibility';
+import type { StoreState } from 'store';
+import { useTheme } from 'hooks/useTheme';
+import { Button } from 'components/button';
+import { Auth } from 'components/auth';
+import { Avatar } from 'components/avatar';
+import { SignOutIcon } from 'components/icons/signout';
+import { IconButton } from 'components/icon-button/icon-button';
+import { messages } from 'components/auth/auth.messages';
+
+import styles from './auth-panel.module.css';
+
+interface OwnProps {
+  user: User | null;
+  hiddenUsers: StoreState['hiddenUsers'];
+  isCommentsDisabled: boolean;
+  postInfo: PostInfo;
+
+  signout(): Promise<void>;
+  onCommentsChangeReadOnlyMode(readOnly: boolean): Promise<void>;
+  onBlockedUsersShow(): void;
+  onBlockedUsersHide(): void;
+}
+
+export interface Props extends OwnProps {
+  intl: IntlShape;
+  theme: Theme;
+}
+
+interface State {
+  isBlockedVisible: boolean;
+  anonymousUsernameInputValue: string;
+}
+
+class AuthPanelComponent extends Component<Props, State> {
+  state = {
+    isBlockedVisible: false,
+    anonymousUsernameInputValue: 'anon',
+  };
+
+  toggleBlockedVisibility = () => {
+    if (!this.state.isBlockedVisible) {
+      if (this.props.onBlockedUsersShow) this.props.onBlockedUsersShow();
+    } else if (this.props.onBlockedUsersHide) this.props.onBlockedUsersHide();
+
+    this.setState({ isBlockedVisible: !this.state.isBlockedVisible });
+  };
+
+  toggleCommentsAvailability = () => {
+    this.props.onCommentsChangeReadOnlyMode(!this.props.isCommentsDisabled);
+  };
+
+  renderAuthorized = (user: User) => {
+    return (
+      <div className={styles.user}>
+        <button
+          className={styles.userButton}
+          onClick={() => postMessageToParent({ profile: { ...user, current: '1' } })}
+          title={this.props.intl.formatMessage(messages.openProfile)}
+        >
+          <div className={styles.userAvatar}>
+            <Avatar url={user.picture} />
+          </div>
+          {user.name}
+        </button>{' '}
+        <div className={styles.userLogoutButton}>
+          <IconButton title={this.props.intl.formatMessage(messages.signout)} onClick={this.props.signout}>
+            <SignOutIcon size="14" />
+          </IconButton>
+        </div>
+      </div>
+    );
+  };
+
+  renderThirdPartyWarning = () => {
+    if (IS_STORAGE_AVAILABLE || !IS_THIRD_PARTY) return null;
+    return (
+      <div className={styles.column}>
+        <FormattedMessage
+          id="authPanel.disabled-cookies"
+          defaultMessage="Enable third-party cookies to log in, or open comments in"
+        />{' '}
+        <a
+          href={`${window.location.origin}/web/comments.html${window.location.search}`}
+          target="_blank"
+          rel="noreferrer"
+        >
+          <FormattedMessage id="authPanel.new-page" defaultMessage="a new page" />
+        </a>
+      </div>
+    );
+  };
+
+  renderCookiesWarning = () => {
+    if (IS_STORAGE_AVAILABLE || IS_THIRD_PARTY) {
+      return null;
+    }
+    return (
+      <div className={styles.column}>
+        <FormattedMessage id="authPanel.enable-cookies" defaultMessage="Allow cookies to log in and comment" />
+      </div>
+    );
+  };
+
+  renderSettingsLabel = () => {
+    return (
+      <Button
+        kind="link"
+        className={styles.adminAction}
+        {...getHandleClickProps(this.toggleBlockedVisibility)}
+        role="link"
+      >
+        {this.state.isBlockedVisible ? (
+          <FormattedMessage id="authPanel.hide-settings" defaultMessage="Hide settings" />
+        ) : (
+          <FormattedMessage id="authPanel.show-settings" defaultMessage="Show settings" />
+        )}
+      </Button>
+    );
+  };
+
+  renderReadOnlySwitch = () => {
+    const { isCommentsDisabled } = this.props;
+    return (
+      <Button
+        kind="link"
+        className={styles.adminAction}
+        {...getHandleClickProps(this.toggleCommentsAvailability)}
+        role="link"
+      >
+        {isCommentsDisabled ? (
+          <FormattedMessage id="authPanel.enable-comments" defaultMessage="Enable comments" />
+        ) : (
+          <FormattedMessage id="authPanel.disable-comments" defaultMessage="Disable comments" />
+        )}
+      </Button>
+    );
+  };
+
+  render({ user, postInfo }: Props, { isBlockedVisible }: State) {
+    const { read_only } = postInfo;
+    const isAdmin = user && user.admin;
+    const isSettingsLabelVisible = Object.keys(this.props.hiddenUsers).length > 0 || isAdmin || isBlockedVisible;
+
+    return (
+      <div className={styles.root}>
+        <div className={styles.column}>{user ? this.renderAuthorized(user) : read_only && <Auth />}</div>
+        {this.renderThirdPartyWarning()}
+        {this.renderCookiesWarning()}
+        <div className={clsx(styles.column, styles.columnSeparated)}>
+          {isSettingsLabelVisible && <span>{this.renderSettingsLabel()}</span>}
+          {isAdmin && <span>{this.renderReadOnlySwitch()}</span>}
+          {!isAdmin && read_only && (
+            <span>
+              <FormattedMessage id="authPanel.read-only" defaultMessage="Comments disabled" />
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
+}
+
+export function AuthPanel(props: OwnProps) {
+  const intl = useIntl();
+  const theme = useTheme();
+
+  return <AuthPanelComponent intl={intl} theme={theme} {...props} />;
+}

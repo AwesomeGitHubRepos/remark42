@@ -1,9 +1,8 @@
 package migrator
 
 import (
-	"errors"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"strings"
 )
 
@@ -30,7 +29,7 @@ func NewURLMapper(reader io.Reader) (Mapper, error) {
 // https://www.myblog.com/blog/1/ https://myblog.com/blog/1/
 // https://www.myblog.com/* https://myblog.com/*
 func (u *URLMapper) loadRules(reader io.Reader) error {
-	data, err := ioutil.ReadAll(reader)
+	data, err := io.ReadAll(reader)
 	if err != nil {
 		return err
 	}
@@ -39,11 +38,11 @@ func (u *URLMapper) loadRules(reader io.Reader) error {
 
 	u.rules = make(map[string]string)
 
-	for _, row := range strings.Split(rulesText, "\n") {
+	for row := range strings.SplitSeq(rulesText, "\n") {
 		row = strings.TrimSpace(row)
 		urls := strings.Split(row, " ")
 		if len(urls) != 2 {
-			return errors.New("bad row " + row)
+			return fmt.Errorf("bad row %s", row)
 		}
 
 		from, to := strings.TrimSpace(urls[0]), strings.TrimSpace(urls[1])
@@ -65,8 +64,8 @@ func (u *URLMapper) URL(url string) string {
 		}
 		oldURL = strings.TrimSuffix(oldURL, "*")
 		newURL = strings.TrimSuffix(newURL, "*")
-		if strings.HasPrefix(url, oldURL) {
-			return newURL + strings.TrimPrefix(url, oldURL)
+		if after, ok := strings.CutPrefix(url, oldURL); ok {
+			return newURL + after
 		}
 	}
 	// search failed, return given url

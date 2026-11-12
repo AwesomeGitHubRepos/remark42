@@ -9,10 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi"
+	"github.com/jessevdk/go-flags"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/umputun/go-flags"
 
 	"github.com/umputun/remark42/backend/app/store"
 )
@@ -46,7 +45,6 @@ func TestCleanup_IsSpam(t *testing.T) {
 	}
 
 	for n, tt := range tbl {
-		tt := tt
 		checkName := fmt.Sprintf("check-%d-%s", n, tt.name)
 		t.Run(checkName, func(t *testing.T) {
 			c := store.Comment{ID: checkName, Text: tt.text, Score: tt.score}
@@ -59,8 +57,7 @@ func TestCleanup_IsSpam(t *testing.T) {
 }
 
 func TestCleanup_postsInRange(t *testing.T) {
-
-	r := chi.NewRouter()
+	r := http.NewServeMux()
 	cleanupRoutes(t, r, nil)
 	ts := httptest.NewServer(r)
 	defer ts.Close()
@@ -83,7 +80,7 @@ func TestCleanup_postsInRange(t *testing.T) {
 }
 
 func TestCleanup_listComments(t *testing.T) {
-	r := chi.NewRouter()
+	r := http.NewServeMux()
 	cleanupRoutes(t, r, nil)
 	ts := httptest.NewServer(r)
 	defer ts.Close()
@@ -109,7 +106,7 @@ func TestCleanup_listComments(t *testing.T) {
 
 func TestCleanup_ExecuteSpam(t *testing.T) {
 	cleaned := cleanedComments{}
-	r := chi.NewRouter()
+	r := http.NewServeMux()
 	cleanupRoutes(t, r, &cleaned)
 	ts := httptest.NewServer(r)
 	defer ts.Close()
@@ -128,7 +125,7 @@ func TestCleanup_ExecuteSpam(t *testing.T) {
 
 func TestCleanup_ExecuteTitle(t *testing.T) {
 	titledComments := cleanedComments{}
-	r := chi.NewRouter()
+	r := http.NewServeMux()
 	cleanupRoutes(t, r, &titledComments)
 	ts := httptest.NewServer(r)
 	defer ts.Close()
@@ -144,7 +141,7 @@ func TestCleanup_ExecuteTitle(t *testing.T) {
 	assert.Equal(t, []string{"/api/v1/admin/title/1", "/api/v1/admin/title/2", "/api/v1/admin/title/3", "/api/v1/admin/title/11"}, titledComments.ids)
 }
 
-func cleanupRoutes(t *testing.T, r *chi.Mux, c *cleanedComments) {
+func cleanupRoutes(t *testing.T, r *http.ServeMux, c *cleanedComments) {
 	r.HandleFunc("/api/v1/list", func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "GET", r.Method)
 		require.Equal(t, "site=remark&limit=10000", r.URL.RawQuery)
@@ -175,7 +172,7 @@ func cleanupRoutes(t *testing.T, r *chi.Mux, c *cleanedComments) {
 
 		commentsWithInfo := struct {
 			Comments []store.Comment `json:"comments"`
-			Info     store.PostInfo  `json:"info,omitempty"`
+			Info     store.PostInfo  `json:"info"`
 		}{}
 
 		switch r.URL.Query().Get("url") {
@@ -196,7 +193,7 @@ func cleanupRoutes(t *testing.T, r *chi.Mux, c *cleanedComments) {
 		require.NoError(t, json.NewEncoder(w).Encode(commentsWithInfo))
 	})
 
-	r.HandleFunc("/api/v1/admin/comment/{id}", func(w http.ResponseWriter, r *http.Request) {
+	r.HandleFunc("/api/v1/admin/comment/{id}", func(_ http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "DELETE", r.Method)
 		t.Log("delete ", r.URL.Path)
 		c.lock.Lock()
@@ -204,12 +201,54 @@ func cleanupRoutes(t *testing.T, r *chi.Mux, c *cleanedComments) {
 		c.lock.Unlock()
 	})
 
-	r.HandleFunc("/api/v1/admin/title/{id}", func(w http.ResponseWriter, r *http.Request) {
+	r.HandleFunc("/api/v1/admin/title/{id}", func(_ http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "PUT", r.Method)
 		t.Log("title for ", r.URL.Path)
 		c.lock.Lock()
 		c.ids = append(c.ids, r.URL.Path)
 		c.lock.Unlock()
 	})
+}
 
+func TestCleanup_RequestsKeepPostURLQuery(t *testing.T) {
+	const postURL = "https://example.com/post?id=1&lang=en"
+	const site = "site&x"
+	type received struct{ method, path, site, url, format, user string }
+	var lock sync.Mutex
+	var got []received
+	record := func(r *http.Request) {
+		lock.Lock()
+		defer lock.Unlock()
+		user, _, _ := r.BasicAuth()
+		got = append(got, received{method: r.Method, path: r.URL.Path, site: r.URL.Query().Get("site"),
+			url: r.URL.Query().Get("url"), format: r.URL.Query().Get("format"), user: user})
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/find", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		_, _ = w.Write([]byte(`{"comments":[]}`))
+	})
+	mux.HandleFunc("/api/v1/admin/comment/{id}", func(_ http.ResponseWriter, r *http.Request) { record(r) })
+	mux.HandleFunc("/api/v1/admin/title/{id}", func(_ http.ResponseWriter, r *http.Request) { record(r) })
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	cmd := CleanupCommand{}
+	cmd.SetCommon(CommonOpts{RemarkURL: ts.URL, SharedSecret: "123456"})
+	p := flags.NewParser(&cmd, flags.Default)
+	_, err := p.ParseArgs([]string{"--site=" + site, "--admin-passwd=secret"})
+	require.NoError(t, err)
+
+	_, err = cmd.listComments(postURL)
+	require.NoError(t, err)
+	c := store.Comment{ID: "1", Locator: store.Locator{URL: postURL}}
+	require.NoError(t, cmd.deleteComment(c))
+	require.NoError(t, cmd.setTitle(c))
+
+	assert.Equal(t, []received{
+		{method: "GET", path: "/api/v1/find", site: site, url: postURL, format: "plain"},
+		{method: "DELETE", path: "/api/v1/admin/comment/1", site: site, url: postURL, format: "plain", user: "admin"},
+		{method: "PUT", path: "/api/v1/admin/title/1", site: site, url: postURL, format: "plain", user: "admin"},
+	}, got, "site and post URL arrive intact, including the post URL's own query")
 }

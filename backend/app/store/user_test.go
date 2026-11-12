@@ -2,7 +2,7 @@ package store
 
 import (
 	"crypto/sha1"
-	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -55,7 +55,6 @@ func TestUser_HashFailed(t *testing.T) {
 
 	r = hashWithFallback(sha1.New(), "123456789")
 	assert.Equal(t, "f7c3bc1d808e04732adf679965ccc34ca7ae3441", r)
-
 }
 
 type mockHash struct{}
@@ -64,4 +63,4 @@ func (mock mockHash) Sum(_ []byte) []byte               { return nil }
 func (mock mockHash) Reset()                            {}
 func (mock mockHash) Size() int                         { return 0 }
 func (mock mockHash) BlockSize() int                    { return 0 }
-func (mock mockHash) Write(_ []byte) (n int, err error) { return 0, errors.New("error") }
+func (mock mockHash) Write(_ []byte) (n int, err error) { return 0, fmt.Errorf("error") }

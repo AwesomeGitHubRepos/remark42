@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "incremental": true,
+    "target": "es6",
+    "module": "esnext",
+    "lib": ["es2021", "dom"],
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact",
+    "noEmit": true,
+    // the dependency-free tests and every module they reach import with an explicit .ts
+    // extension, which is the only form node --test resolves; webpack, jest and this compiler all
+    // accept it. shipped modules are among them, so the option is not test-only
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "moduleResolution": "node",
+    "verbatimModuleSyntax": true,
+    "resolveJsonModule": true,
+    "baseUrl": "app",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "paths": {
+      "preact": ["../node_modules/preact"],
+      "preact/*": ["../node_modules/preact/*"]
+    }
+  },
+  "include": ["app/typings", "app/**/*.tsx", "app/**/*.ts"]
+}

@@ -3,7 +3,7 @@ package image
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -15,7 +15,7 @@ import (
 )
 
 func TestRemote_SaveWithID(t *testing.T) {
-	ts := testServer(t, fmt.Sprintf(`{"method":"image.save_with_id","params":["54321","%s"],"id":1}`, gopher),
+	ts := testServer(t, fmt.Sprintf(`{"method":"image.save_with_id","params":["54321",%q],"id":1}`, gopher),
 		`{"id":1}`)
 	defer ts.Close()
 	c := RPC{Client: jrpc.Client{API: ts.URL, Client: http.Client{}}}
@@ -41,6 +41,18 @@ func TestRemote_Load(t *testing.T) {
 	assert.Equal(t, gopherPNGBytes(), res)
 }
 
+func TestRemote_Delete(t *testing.T) {
+	ts := testServer(t, `{"method":"image.delete","params":"54321","id":1}`, `{}`)
+	defer ts.Close()
+	c := RPC{Client: jrpc.Client{API: ts.URL, Client: http.Client{}}}
+
+	var a Store = &c
+	_ = a
+
+	err := c.Delete("54321")
+	assert.NoError(t, err)
+}
+
 func TestRemote_Commit(t *testing.T) {
 	ts := testServer(t, `{"method":"image.commit","params":"gopher_id","id":1}`, `{"id":1}`)
 	defer ts.Close()
@@ -50,6 +62,18 @@ func TestRemote_Commit(t *testing.T) {
 	_ = a
 
 	err := c.Commit("gopher_id")
+	assert.NoError(t, err)
+}
+
+func TestRemote_ResetCleanupTimer(t *testing.T) {
+	ts := testServer(t, `{"method":"image.reset_cleanup_timer","params":"gopher_id","id":1}`, `{"id":1}`)
+	defer ts.Close()
+	c := RPC{Client: jrpc.Client{API: ts.URL, Client: http.Client{}}}
+
+	var a Store = &c
+	_ = a
+
+	err := c.ResetCleanupTimer("gopher_id")
 	assert.NoError(t, err)
 }
 
@@ -81,7 +105,7 @@ func TestRemote_Info(t *testing.T) {
 
 func testServer(t *testing.T, req, resp string) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		require.NoError(t, err)
 		assert.Equal(t, req, string(body))
 		_, _ = fmt.Fprint(w, resp)

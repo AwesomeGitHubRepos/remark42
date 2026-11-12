@@ -2,11 +2,14 @@
 package admin
 
 import (
-	"errors"
+	"fmt"
 	"strings"
 
 	log "github.com/go-pkgz/lgr"
 )
+
+// NOTE: matryer/moq should be installed globally and works with `go generate ./...`
+//go:generate moq --out admin_mock.go . Store
 
 // Store defines interface returning admins info for given site
 type Store interface {
@@ -50,7 +53,7 @@ func NewStaticKeyStore(key string) *StaticStore {
 // Key returns static key, same for all sites
 func (s *StaticStore) Key(_ string) (key string, err error) {
 	if s.key == "" {
-		return "", errors.New("empty key for static key store")
+		return "", fmt.Errorf("empty key for static key store")
 	}
 	return s.key, nil
 }
@@ -78,5 +81,5 @@ func (s *StaticStore) Enabled(site string) (ok bool, err error) {
 	return false, nil
 }
 
-// OnEvent doesn nothing for StaticStore
+// OnEvent does nothing for StaticStore
 func (s *StaticStore) OnEvent(_ string, _ EventType) error { return nil }
